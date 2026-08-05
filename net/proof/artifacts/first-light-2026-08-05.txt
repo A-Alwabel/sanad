@@ -1,0 +1,109 @@
+
+========================================================================
+  1. Starting the Sanad network (1 coordinator + 2 nodes)
+========================================================================
+{
+  "nodes": [
+    {
+      "node_id": "jeddah-b",
+      "host": "127.0.0.1",
+      "port": 50071,
+      "operator": "bilal",
+      "last_seen": 1785911173.488836
+    },
+    {
+      "node_id": "riyadh-a",
+      "host": "127.0.0.1",
+      "port": 50070,
+      "operator": "amina",
+      "last_seen": 1785911173.4802268
+    }
+  ],
+  "balances": {},
+  "jobs_done": 0
+}
+
+========================================================================
+  2. Real inference, sharded across both nodes (anonymous user)
+========================================================================
+{
+  "user": "anon",
+  "priority_at_submit": 0.0,
+  "pipeline": [
+    {
+      "node_id": "jeddah-b",
+      "endpoint": "127.0.0.1:50071",
+      "operator": "bilal"
+    },
+    {
+      "node_id": "riyadh-a",
+      "endpoint": "127.0.0.1:50070",
+      "operator": "amina"
+    }
+  ],
+  "text": "a network of servers that work together to perform complex calculations and data processing tasks. They are often used in the mining industry to increase the speed and efficiency of mining",
+  "wall_s": 6.52,
+  "shard_map": {
+    "RPC0": {
+      "endpoint": "127.0.0.1:50071",
+      "layers": "0-12",
+      "n_layers": 13
+    },
+    "RPC1": {
+      "endpoint": "127.0.0.1:50070",
+      "layers": "13-24",
+      "n_layers": 12
+    }
+  },
+  "decode_tokens": 31,
+  "tok_per_s": 43.72
+}
+
+========================================================================
+  3. Credit accounting: serving earned credits for node operators
+========================================================================
+{
+  "bilal": 15.5,
+  "amina": 15.5
+}
+
+========================================================================
+  4. Priority: contributor (amina) vs anonymous (zed), submitted after her queue rival
+========================================================================
+completion order (user, priority_at_submit):
+  anon     priority=0.0
+  amina    priority=15.5
+  zed      priority=0.0
+-> amina was queued AFTER zed but served BEFORE him: credits buy priority.
+-> zed (anonymous, zero credits) was still served: priority, never access.
+
+========================================================================
+  5. Final network state
+========================================================================
+{
+  "nodes": [
+    {
+      "node_id": "jeddah-b",
+      "host": "127.0.0.1",
+      "port": 50071,
+      "operator": "bilal",
+      "last_seen": 1785911197.5233722
+    },
+    {
+      "node_id": "riyadh-a",
+      "host": "127.0.0.1",
+      "port": 50070,
+      "operator": "amina",
+      "last_seen": 1785911197.5233722
+    }
+  ],
+  "balances": {
+    "bilal": 50.0,
+    "amina": 27.0
+  },
+  "jobs_done": 4
+}
+
+========================================================================
+  FIRST LIGHT: PASS - real sharded inference + fair credits, end to end
+========================================================================

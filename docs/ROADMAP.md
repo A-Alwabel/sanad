@@ -17,9 +17,13 @@ scrutiny from the people who built the priors.
   Hivemind/prima.cpp/exo authors where they'll engage.
 - Discrete-event simulation of the swarm: pipeline assembly, churn, credit flows, Sybil
   scenarios, queue fairness — calibrated with published WAN numbers (arXiv 2602.16760)
-  rather than optimistic guesses.
-- Backend adapter spike: drive llama.cpp RPC (LAN only, per its own "fragile and
-  insecure" warning) and Parallax through a common adapter interface on 2–3 machines.
+  rather than optimistic guesses. *(Initial simulation shipped in [prototype/](../prototype/).)*
+- ~~Backend adapter spike: drive llama.cpp RPC (LAN only, per its own "fragile and
+  insecure" warning) through an adapter on separate processes.~~ **DONE 2026-08-05 —
+  "First Light": real sharded inference + live credit accounting end to end, single
+  machine, via the llama.cpp RPC adapter in [net/](../net/). See [PROOF.md](PROOF.md).**
+  Remaining spike work: Parallax/BloomBee behind the same interface, and the
+  multi-machine version of the same proof.
 
 **Exit criteria:** ≥10 engaged contributors (issues/PRs/design review, not stars);
 written design feedback from at least two of the three named upstream communities;

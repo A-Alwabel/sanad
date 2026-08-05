@@ -4,7 +4,9 @@
 
 **Sanad** (Arabic: *سند*, "support" — and the classical term for the **chain of transmission** that carries knowledge from person to person, each link vouching for the next) is a community inference network for large open-weight language models. Nodes each hold a *slice* of a model's layers; chained together, they serve models none of them could run alone. Contributing compute earns **non-tradeable credits** that give you priority when you use the network.
 
-**Status: Phase 0 — RFC, prototype simulation, founding contributors wanted.** Nothing here is a product yet. Read the [Concept](docs/CONCEPT.md), run the [simulation](prototype/), and open an issue.
+**Status: First Light achieved (2026-08-05).** A real Sanad network ran end to end: a real model's layers physically split across two node processes over TCP (layers 0–12 on one, 13–24 on the other), real text generated through the chain, and the credit ledger proven live — serving earned credits, a contributor queued *behind* an anonymous user was served *before* him, and the anonymous user was still served. **[Read the proof →](docs/PROOF.md)** · [Run it yourself →](net/README.md)
+
+Still day one: single-machine, trusted nodes, 0.5B model — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
 اقرأ الملخص بالعربية: [README.ar.md](README.ar.md)
 
@@ -55,17 +57,23 @@ Honesty is a design principle here (over-promising is how this field loses trust
 - Serving verified tokens **earns credits**; credits buy **priority**, nothing else.
 - Sanad does not reinvent inference: real backends plug in via adapters (llama.cpp RPC, [Parallax](https://github.com/GradientHQ/parallax), [BloomBee](https://github.com/ai-decentralized/BloomBee)). Sanad's contribution is the **network and fairness layer** on top.
 
-## Try the simulation
+## Try it
 
-The [prototype](prototype/) is a runnable, dependency-free simulation of the network semantics — sharding, pipeline assembly, the credit ledger, priority scheduling:
+**The real thing** ([net/](net/)) — actual sharded inference through llama.cpp's RPC backend, with Sanad's coordinator and credit ledger on top (needs the llama.cpp binaries + a small GGUF model, setup in [net/README.md](net/README.md)):
+
+```bash
+cd net
+python -m unittest discover -s tests -v      # 7 tests, no binaries needed
+python proof/run_first_light.py              # full network + proof, ends in "FIRST LIGHT: PASS"
+```
+
+**The simulation** ([prototype/](prototype/)) — dependency-free model of the network semantics (sharding, pipeline assembly, credit priority), useful for understanding and testing the fairness logic:
 
 ```bash
 cd prototype
 python -m sanad.demo          # watch a "70B" model run across 6 small mock workers
 python -m unittest discover -s tests -v
 ```
-
-Real inference backends are Phase 1 — see the [Roadmap](docs/ROADMAP.md).
 
 ## Documents
 

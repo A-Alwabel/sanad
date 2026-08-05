@@ -32,10 +32,20 @@ def main() -> None:
     ask.add_argument("--user", default="anon")
     ask.add_argument("--max-tokens", type=int, default=48)
     sub.add_parser("status")
+    stmt = sub.add_parser("statement", help="wallet-style ledger statement")
+    stmt.add_argument("--user", default=None, help="filter to one account")
     args = ap.parse_args()
 
     if args.cmd == "status":
         print(json.dumps(call(args.coordinator, "/status"), indent=2, ensure_ascii=False))
+    elif args.cmd == "statement":
+        entries = call(args.coordinator, "/ledger")["entries"]
+        if args.user:
+            entries = [e for e in entries if e["account"] == args.user]
+        for e in entries:
+            print(f"{e['delta']:+9.3f}  {e['account']:10s}  {e['reason']}")
+        total = sum(e["delta"] for e in entries)
+        print(f"{total:+9.3f}  TOTAL")
     else:
         result = call(args.coordinator, "/ask", {
             "user": args.user, "prompt": args.prompt, "max_tokens": args.max_tokens,

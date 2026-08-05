@@ -1,0 +1,141 @@
+
+========================================================================
+  1. Coordinator up with a 2-tier catalog; dedicated node A joins (pledge 1000 MB)
+========================================================================
+[riyadh-a] SERVING on 127.0.0.1:50090 (pledge 1000.0 MB, BELOW_NORMAL priority, operator amina)
+{
+  "model": "qwen2.5-0.5b-instruct-q4_k_m",
+  "pool_mb": 1000.0,
+  "catalog": [
+    {
+      "name": "qwen2.5-0.5b-instruct-q4_k_m",
+      "file_mb": 491.4,
+      "need_mb": 688.0
+    },
+    {
+      "name": "qwen2.5-1.5b-instruct-q4_k_m",
+      "file_mb": 1117.3,
+      "need_mb": 1564.2
+    }
+  ]
+}
+
+========================================================================
+  2. Ask with one node -> served by the SMALL model
+========================================================================
+{
+  "user": "anon",
+  "model": "qwen2.5-0.5b-instruct-q4_k_m",
+  "text": "a vast and mysterious place, with its own unique characteristics and beauty. It is a place where the sea is not only",
+  "tok_per_s": 44.31,
+  "shard_map": {
+    "RPC0": {
+      "endpoint": "127.0.0.1:50090",
+      "layers": "0-24",
+      "n_layers": 25
+    }
+  },
+  "repaired": false
+}
+
+========================================================================
+  3. LADDER UP: polite node B joins (pledge 700 MB) -> pool fits the LARGE model
+========================================================================
+[jeddah-b] SERVING on 127.0.0.1:50091 (pledge 700.0 MB, BELOW_NORMAL priority, operator bilal)
+{
+  "user": "anon",
+  "model": "qwen2.5-1.5b-instruct-q4_k_m",
+  "text": "a group of miners who combine their computing power to solve complex mathematical problems and earn rewards. In a certain mining pool,",
+  "tok_per_s": 22.13,
+  "shard_map": {
+    "RPC0": {
+      "endpoint": "127.0.0.1:50091",
+      "layers": "0-11",
+      "n_layers": 12
+    },
+    "RPC1": {
+      "endpoint": "127.0.0.1:50090",
+      "layers": "12-28",
+      "n_layers": 17
+    }
+  },
+  "repaired": false
+}
+
+========================================================================
+  4. WEIGHTED FAIRNESS: credits follow the memory pledge (1000 vs 700)
+========================================================================
+{
+  "amina": 36.483000000000004,
+  "bilal": 9.517
+}
+
+========================================================================
+  5. THE POLITE NODE: owner starts heavy work -> node B drains out on its own
+========================================================================
+[jeddah-b] owner is busy (other-process load ~52%) -> draining out politely, all memory returned
+(cpu hog pid=319716 started at NORMAL priority - simulating the owner's game)
+nodes now: ['riyadh-a']  model: qwen2.5-0.5b-instruct-q4_k_m
+
+========================================================================
+  6. Network keeps serving DURING the owner's heavy work (slower, but alive)
+========================================================================
+{
+  "user": "anon",
+  "model": "qwen2.5-0.5b-instruct-q4_k_m",
+  "text": "the sun is directly overhead. The sun is directly overhead at",
+  "tok_per_s": 34.14,
+  "shard_map": {
+    "RPC0": {
+      "endpoint": "127.0.0.1:50090",
+      "layers": "0-24",
+      "n_layers": 25
+    }
+  },
+  "repaired": false
+}
+
+========================================================================
+  7. Owner finishes -> machine calm -> node B rejoins BY ITSELF -> LADDER UP again
+========================================================================
+[jeddah-b] machine calm again (~4%) -> rejoining the network
+[jeddah-b] SERVING on 127.0.0.1:50091 (pledge 700.0 MB, BELOW_NORMAL priority, operator bilal)
+(cpu hog terminated)
+{
+  "user": "anon",
+  "model": "qwen2.5-1.5b-instruct-q4_k_m",
+  "text": "they are hot. The hotter they are, the brighter they are. The hotter a star is, the more energy it",
+  "tok_per_s": 24.1,
+  "shard_map": {
+    "RPC0": {
+      "endpoint": "127.0.0.1:50091",
+      "layers": "0-11",
+      "n_layers": 12
+    },
+    "RPC1": {
+      "endpoint": "127.0.0.1:50090",
+      "layers": "12-28",
+      "n_layers": 17
+    }
+  },
+  "repaired": false
+}
+
+========================================================================
+  8. WITHDRAWAL IS NEVER PUNISHED: bilal's wallet statement
+========================================================================
+     +9.517  served 12/29 layers of qwen2.5-1.5b-instruct-q4_k_m for 23 tokens via jeddah-b
+     +9.517  served 12/29 layers of qwen2.5-1.5b-instruct-q4_k_m for 23 tokens via jeddah-b
+  balance before leaving: 9.517  after rejoining: 19.034
+
+========================================================================
+  9. The ladder's own event log
+========================================================================
+  LADDER UP: model -> qwen2.5-0.5b-instruct-q4_k_m (pool 1000 MB across 1 nodes)
+  LADDER UP: model -> qwen2.5-1.5b-instruct-q4_k_m (pool 1700 MB across 2 nodes)
+  LADDER DOWN: model -> qwen2.5-0.5b-instruct-q4_k_m (pool 1000 MB across 1 nodes)
+  LADDER UP: model -> qwen2.5-1.5b-instruct-q4_k_m (pool 1700 MB across 2 nodes)
+
+========================================================================
+  LIVING NETWORK: PASS - ladder + polite node + weighted fairness, end to end
+========================================================================

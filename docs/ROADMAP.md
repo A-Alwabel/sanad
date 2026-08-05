@@ -24,6 +24,22 @@ scrutiny from the people who built the priors.
   machine, via the llama.cpp RPC adapter in [net/](../net/). See [PROOF.md](PROOF.md).**
   Remaining spike work: Parallax/BloomBee behind the same interface, and the
   multi-machine version of the same proof.
+- **DONE 2026-08-05 — v0.2 "The Living Network"** ([PROOF.md](PROOF.md) Part 2):
+  capacity ladder (network automatically serves the largest model the pledged
+  pool holds, up/down as members come and go), the polite node (memory pledge,
+  BELOW_NORMAL OS priority, busy sensor with graceful drain/rejoin — the owner
+  always comes first, withdrawal never punished), layer-share weighted credits
+  (memory lent == share earned, enforced via --tensor-split), and chain-repair
+  retry.
+- **NEXT — "The Scout" (semi-automatic catalog refresh):** the ladder's catalog
+  should not go stale as better open models ship. Design: a scout job watches
+  model releases and published evals and **proposes** catalog updates as public
+  pull requests (with license check, size/need math, and pinned SHA-256);
+  humans approve in the open, per GOVERNANCE.md. Deliberately NOT fully
+  automatic: model choice is a governance decision (benchmark gaming and
+  contamination are rampant, licenses vary), and an auto-update channel is a
+  supply-chain attack surface — a poisoned "top of leaderboard" model must
+  never be able to auto-deploy itself to the whole network.
 
 **Exit criteria:** ≥10 engaged contributors (issues/PRs/design review, not stars);
 written design feedback from at least two of the three named upstream communities;

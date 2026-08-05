@@ -61,7 +61,7 @@ def main() -> None:
 
     try:
         section("1. Starting the Sanad network (1 coordinator + 2 nodes)")
-        spawn(["sanad_net.coordinator", "--port", "7861", "--model", model, "--llama-bin", llama_bin])
+        spawn(["sanad_net.coordinator", "--port", "7861", "--models", model, "--llama-bin", llama_bin])
         time.sleep(1.5)
         spawn(["sanad_net.node", "--node-id", "riyadh-a", "--operator", "amina",
                "--port", "50070", "--coordinator", COORD, "--rpc-bin", llama_bin])

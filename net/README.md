@@ -1,11 +1,28 @@
-# sanad_net — the real network layer (Phase 1, first light)
+# sanad_net — the real network layer (v0.2, "the living network")
 
 This is Sanad running **for real**: a GGUF model's layers are physically split
 across separate node processes that communicate over TCP, with a Sanad
 coordinator assembling the chain and accounting non-tradeable credits.
 
-It was first proven working on 2026-08-05 — see [docs/PROOF.md](../docs/PROOF.md)
-and the captured transcript in [proof/artifacts/](proof/artifacts/).
+Proven working on 2026-08-05 in two recorded milestones (First Light, then the
+Living Network) — see [docs/PROOF.md](../docs/PROOF.md) and the captured
+transcripts in [proof/artifacts/](proof/artifacts/).
+
+**v0.2 behaviors:**
+- **Capacity ladder** — give the coordinator a catalog (`--models a.gguf,b.gguf`);
+  it always serves the largest model the pledged memory pool can hold,
+  upgrading/downgrading automatically as nodes join and leave.
+- **Polite node** — `--pledge-mb` declares the RAM you lend; the rpc-server
+  runs at BELOW_NORMAL OS priority; the busy sensor (`--busy-at`/`--resume-at`)
+  drains the node out when the owner needs the machine and rejoins it when
+  things calm down. `--busy-at 101` = dedicated node. Withdrawal keeps all credits.
+- **Weighted fairness** — layer shares follow pledges (via `--tensor-split`,
+  verified empirically), and each token's credit is split by the layers each
+  node actually held.
+- **Chain repair** — a job that fails because a node vanished is retried once
+  against the surviving pipeline.
+- **Wallet-style statement** — `client statement --user <name>` prints the
+  audited earn/spend history from `/ledger`.
 
 ## What it is
 
@@ -32,10 +49,12 @@ and the captured transcript in [proof/artifacts/](proof/artifacts/).
   This matches the permissioned-first trust model in
   [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md).
 - Each request currently reloads the model (~seconds of overhead): simple and
-  stateless, but wasteful. A resident pipeline (llama-server or engine adapters)
-  is listed in next steps.
-- Credits split evenly across serving nodes; per-layer-share weighting is
-  modeled in the [simulation](../prototype/) and is future work here.
+  stateless, but wasteful — it is also what makes ladder tier-switching free.
+  A resident pipeline (llama-server or engine adapters) is listed in next steps.
+- The busy sensor samples CPU via PowerShell (Windows-only for now) and is
+  deliberately simple: sustained other-process load in, drain out; calm in,
+  rejoin. Fullscreen/game detection, battery awareness, and hysteresis tuning
+  are open contributor work.
 
 ## Setup (Windows)
 
@@ -57,13 +76,16 @@ Windows-tested only so far — reports welcome).
 ```powershell
 cd net
 
-# terminal 1 — coordinator
+# terminal 1 — coordinator with a capacity-ladder catalog (small,large)
 python -m sanad_net.coordinator --port 7860 `
-    --model ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf --llama-bin ../.local/bin
+    --models ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf,../.local/models/qwen2.5-1.5b-instruct-q4_k_m.gguf `
+    --llama-bin ../.local/bin
 
 # terminals 2 & 3 — two nodes (in real life: two different people's machines)
-python -m sanad_net.node --node-id riyadh-a --operator amina --port 50070 --rpc-bin ../.local/bin --coordinator http://127.0.0.1:7860
-python -m sanad_net.node --node-id jeddah-b --operator bilal --port 50071 --rpc-bin ../.local/bin --coordinator http://127.0.0.1:7860
+# riyadh-a: dedicated (sensor off), pledges 1000 MB
+python -m sanad_net.node --node-id riyadh-a --operator amina --port 50070 --pledge-mb 1000 --busy-at 101 --rpc-bin ../.local/bin --coordinator http://127.0.0.1:7860
+# jeddah-b: polite (drains out when the owner's other apps need the CPU)
+python -m sanad_net.node --node-id jeddah-b --operator bilal --port 50071 --pledge-mb 700 --rpc-bin ../.local/bin --coordinator http://127.0.0.1:7860
 
 # terminal 4 — ask through the chain
 python -m sanad_net.client --coordinator http://127.0.0.1:7860 ask --user amina "What is a mining pool?"

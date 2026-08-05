@@ -4,9 +4,12 @@
 
 **Sanad** (Arabic: *سند*, "support" — and the classical term for the **chain of transmission** that carries knowledge from person to person, each link vouching for the next) is a community inference network for large open-weight language models. Nodes each hold a *slice* of a model's layers; chained together, they serve models none of them could run alone. Contributing compute earns **non-tradeable credits** that give you priority when you use the network.
 
-**Status: First Light achieved (2026-08-05).** A real Sanad network ran end to end: a real model's layers physically split across two node processes over TCP (layers 0–12 on one, 13–24 on the other), real text generated through the chain, and the credit ledger proven live — serving earned credits, a contributor queued *behind* an anonymous user was served *before* him, and the anonymous user was still served. **[Read the proof →](docs/PROOF.md)** · [Run it yourself →](net/README.md)
+**Status: the network is alive (v0.2, 2026-08-05).** Two proven milestones in one day, both with full captured transcripts in [docs/PROOF.md](docs/PROOF.md):
 
-Still day one: single-machine, trusted nodes, 0.5B model — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
+- **First Light** — a real model's layers physically split across two node processes over TCP, real text generated through the chain, credits earned by serving and spent as priority.
+- **The Living Network** — the network now *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it — service never stopped); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself, returning all memory → rejoined by itself when the machine calmed); and credits are **weighted by layer share**, so memory lent equals share earned — with balances fully kept when a node withdraws. Your device, your priority, always.
+
+Still day one: single-machine, trusted nodes, small models — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
 اقرأ الملخص بالعربية: [README.ar.md](README.ar.md)
 

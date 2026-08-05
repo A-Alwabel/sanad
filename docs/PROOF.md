@@ -1,4 +1,15 @@
-# First Light — proof that Sanad works
+# Proofs that Sanad works
+
+Two milestones, both achieved 2026-08-05, both fully reproducible:
+
+| Milestone | What it proves | Transcript | Reproduce |
+|---|---|---|---|
+| **Part 1 — First Light** (v0.1) | Real sharded inference + live credit economy | [first-light transcript](../net/proof/artifacts/first-light-2026-08-05.txt) | [run_first_light.py](../net/proof/run_first_light.py) |
+| **Part 2 — The Living Network** (v0.2) | Capacity ladder + polite node + weighted fairness | [living-network transcript](../net/proof/artifacts/living-network-2026-08-05.txt) | [run_living_network.py](../net/proof/run_living_network.py) |
+
+---
+
+# Part 1 — First Light
 
 **Date:** 2026-08-05 · **Status:** PASS · **Raw transcript:** [net/proof/artifacts/first-light-2026-08-05.txt](../net/proof/artifacts/first-light-2026-08-05.txt) · **Reproduce:** [net/proof/run_first_light.py](../net/proof/run_first_light.py)
 
@@ -98,7 +109,67 @@ python proof/run_first_light.py --llama-bin ../.local/bin `
 Setup for the binaries and model: [net/README.md](../net/README.md). The
 script asserts every claim above and exits with `FIRST LIGHT: PASS`.
 
+---
+
+# Part 2 — The Living Network (v0.2)
+
+**Date:** 2026-08-05 · **Status:** PASS · **Raw transcript:** [net/proof/artifacts/living-network-2026-08-05.txt](../net/proof/artifacts/living-network-2026-08-05.txt) · **Reproduce:** [net/proof/run_living_network.py](../net/proof/run_living_network.py)
+
+Same environment as Part 1, plus a second catalog tier
+(Qwen2.5-**1.5B**-Instruct Q4_K_M, 29 layers). Three claims, all asserted by
+the script and visible in the transcript:
+
+## A. The capacity ladder — the network grows as its community grows
+
+The coordinator always serves the **largest catalog model the pledged memory
+pool can hold** (file size × 1.4 safety factor). From the event log, verbatim:
+
+```
+LADDER UP:   model -> qwen2.5-0.5b... (pool 1000 MB across 1 nodes)
+LADDER UP:   model -> qwen2.5-1.5b... (pool 1700 MB across 2 nodes)   <- node B joined
+LADDER DOWN: model -> qwen2.5-0.5b... (pool 1000 MB across 1 nodes)   <- node B left
+LADDER UP:   model -> qwen2.5-1.5b... (pool 1700 MB across 2 nodes)   <- node B returned
+```
+
+Service never stopped during any transition — per-request model loading makes
+tier switching free.
+
+## B. The polite node — the owner always comes first
+
+Node B ran with the busy sensor on (`--busy-at 45`). The proof started a CPU
+hog at normal priority (simulating the owner launching a game):
+
+- B's sensor measured **other-process** CPU load (its own rpc-server's usage
+  subtracted), saw sustained load, **drained out by itself** (`/leave` + its
+  rpc-server stopped — all memory returned), with zero penalty.
+- The network **kept serving during the "game"** — the surviving node answered
+  alone on the small model (slower under contention, and that's correct:
+  the rpc-server runs at BELOW_NORMAL OS priority, so the owner's game eats
+  first).
+- Hog terminated → machine calm → B **rejoined by itself** → ladder back up.
+
+## C. Weighted fairness — memory lent == share earned
+
+Pledges were 1000 MB (amina) vs 700 MB (bilal). llama.cpp's `--tensor-split`
+was driven by the pledges, and the 29 layers of the 1.5B model split **17 vs
+12** — matching the pledge ratio. Credits per token followed the layer share,
+from bilal's wallet statement in the transcript:
+
+```
++9.517  served 12/29 layers of qwen2.5-1.5b... for 23 tokens via jeddah-b
++9.517  served 12/29 layers of qwen2.5-1.5b... for 23 tokens via jeddah-b
+balance before leaving: 9.517   after rejoining: 19.034
+```
+
+Withdrawal is never punished: the balance survived leaving in full.
+
+## Still not proven (updated)
+
+Everything in Part 1's "what this does NOT prove" list still stands
+(single machine, trusted nodes, small models, no privacy) — minus per-request
+politeness and dynamic capacity, which are now real.
+
 ## Next milestone
 
-Two nodes on **two different machines on two different networks**, same proof
+Two nodes on **two different machines on two different networks**, same proofs
 — then a resident pipeline, then the audit hooks from the roadmap.

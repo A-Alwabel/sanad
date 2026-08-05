@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +49,9 @@ from .ledger import Ledger
 
 NODE_TTL_S = 15.0          # node considered dead if no heartbeat within this window
 POOL_SAFETY_FACTOR = 1.4   # model needs file_size * factor of pooled memory (KV + overhead)
+MAX_TOKENS_CAP = 512       # per-request generation cap
+MAX_PLEDGE_MB = 1_000_000  # 1 TB — sanity bound; also rejects Infinity/NaN smuggled via JSON
+MAX_BODY_BYTES = 1_048_576  # 1 MB request-body cap
 
 
 class CapacityError(RuntimeError):
@@ -235,7 +240,7 @@ class Coordinator:
         self.runner = runner
         self.catalog = catalog
         self.jobs_done = 0
-        self.events: list[dict] = []
+        self.events: deque[dict] = deque(maxlen=1000)  # bounded audit trail
         self._last_tier: str | None = None
         self._tier_lock = threading.Lock()
         self._pending: list[dict] = []
@@ -415,7 +420,7 @@ class Coordinator:
             "nodes": nodes,
             "balances": self.ledger.balances(),
             "jobs_done": self.jobs_done,
-            "events": self.events[-20:],
+            "events": list(self.events)[-20:],
         }
 
 
@@ -434,6 +439,8 @@ def make_handler(coord: Coordinator):
 
         def _read_body(self) -> dict:
             length = int(self.headers.get("Content-Length", 0))
+            if length > MAX_BODY_BYTES:
+                raise ValueError(f"request body too large ({length} bytes)")
             return json.loads(self.rfile.read(length) or b"{}")
 
         def do_GET(self):
@@ -452,9 +459,14 @@ def make_handler(coord: Coordinator):
             try:
                 data = self._read_body()
                 if self.path == "/register":
+                    pledge = float(data.get("pledge_mb", 800))
+                    # Python's json accepts Infinity/NaN — an infinite pledge would
+                    # pin the ladder to the largest tier and NaN would poison math.
+                    if not math.isfinite(pledge) or not 0 < pledge <= MAX_PLEDGE_MB:
+                        raise ValueError(f"pledge_mb must be a finite value in (0, {MAX_PLEDGE_MB}]")
                     coord.registry.register(
                         data["node_id"], data["host"], data["port"],
-                        data["operator"], data.get("pledge_mb", 800),
+                        data["operator"], pledge,
                     )
                     coord.current_tier()  # re-evaluate the ladder on join
                     self._json(200, {"ok": True})
@@ -466,9 +478,11 @@ def make_handler(coord: Coordinator):
                     coord.current_tier()  # re-evaluate the ladder on leave
                     self._json(200, {"ok": ok})
                 elif self.path == "/ask":
-                    result = coord.submit(
-                        data.get("user", "anon"), data["prompt"], int(data.get("max_tokens", 48))
-                    )
+                    raw_tokens = data.get("max_tokens", 48)
+                    if isinstance(raw_tokens, float) and not math.isfinite(raw_tokens):
+                        raise ValueError("max_tokens must be finite")
+                    max_tokens = max(1, min(int(raw_tokens), MAX_TOKENS_CAP))
+                    result = coord.submit(data.get("user", "anon"), data["prompt"], max_tokens)
                     self._json(200, result)
                 else:
                     self._json(404, {"error": "unknown path"})

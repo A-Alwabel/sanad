@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -385,6 +386,43 @@ class TestHTTPRoundTrip(unittest.TestCase):
             self.assertAlmostEqual(minted, 25.0, places=2)
             self.assertTrue(call("/leave", {"node_id": "n2"})["ok"])
             self.assertEqual(call("/status")["model"], "small")
+        finally:
+            server.shutdown()
+
+    def test_input_validation(self):
+        coord, _ = mk_coord(nodes=False)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{port}"
+
+        def post_raw(path, body: str) -> int:
+            req = urllib.request.Request(
+                f"{base}{path}", data=body.encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        try:
+            # Infinity/NaN pledges rejected (Python json parses them!)
+            code = post_raw("/register", '{"node_id":"evil","host":"127.0.0.1","port":1,'
+                                         '"operator":"x","pledge_mb":Infinity}')
+            self.assertEqual(code, 500)
+            code = post_raw("/register", '{"node_id":"evil","host":"127.0.0.1","port":1,'
+                                         '"operator":"x","pledge_mb":NaN}')
+            self.assertEqual(code, 500)
+            self.assertEqual(coord.registry.alive(), [])   # nothing registered
+            # negative/huge max_tokens are clamped, not honored
+            coord.registry.register("n1", "127.0.0.1", 50060, "amina", 1000)
+            req = urllib.request.Request(
+                f"{base}/ask", data=json.dumps({"user": "anon", "prompt": "x",
+                                                "max_tokens": -99}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.assertEqual(json.loads(resp.read())["decode_tokens"], 25)  # served, clamped to >=1
         finally:
             server.shutdown()
 

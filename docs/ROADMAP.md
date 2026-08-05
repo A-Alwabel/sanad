@@ -31,6 +31,12 @@ scrutiny from the people who built the priors.
   always comes first, withdrawal never punished), layer-share weighted credits
   (memory lent == share earned, enforced via --tensor-split), and chain-repair
   retry.
+- **IN REVIEW — RFC 0001 "The Human Loop"** ([rfc/0001-human-loop.md](rfc/0001-human-loop.md)):
+  community feedback (thumbs + duels) earning capped, vested credits; integrity
+  layer before the first credit is paid; community-owned open preference
+  dataset; training explicitly deferred behind published unfreeze criteria.
+  Built on five specialized research reviews (precedents, incentive integrity,
+  poisoning, training stack, prior art) — see the RFC's references.
 - **NEXT — "The Scout" (semi-automatic catalog refresh):** the ladder's catalog
   should not go stale as better open models ship. Design: a scout job watches
   model releases and published evals and **proposes** catalog updates as public

@@ -84,6 +84,7 @@ python -m unittest discover -s tests -v
 - [**Prior Art**](docs/PRIOR_ART.md) — the full annotated landscape (Aug 2026), every project this stands on
 - [**Architecture**](docs/ARCHITECTURE.md) — v0 design: roles, credit ledger, trust model, wire sketches
 - [**Roadmap**](docs/ROADMAP.md) — phases with honest exit criteria and kill-criteria
+- [**RFC 0001: The Human Loop**](docs/rfc/0001-human-loop.md) — v0.3 design under community review: rate answers, earn credits, build the first fully open preference dataset — with the integrity defenses first and training explicitly deferred
 - [**Contributing**](CONTRIBUTING.md) · [**Governance**](GOVERNANCE.md) · [**Code of Conduct**](CODE_OF_CONDUCT.md)
 
 ## Standing on shoulders

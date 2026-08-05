@@ -20,9 +20,12 @@ We are looking for **founding contributors**: people who want to argue the
 design into shape, do the research, and build the next working pieces.
 Contributions are currently most valuable in four places: multi-machine
 testing, a Linux/macOS port of `net/` (binary names are hardcoded with `.exe`
-and the busy sensor shells out to PowerShell), tests, and review of the
-upcoming human-loop RFC. If you join now, you are joining a project on day
-one — with everything that implies, good and bad.
+and the busy sensor uses Windows kernel APIs), tests, and review of
+[RFC 0001: The Human Loop](docs/rfc/0001-human-loop.md) — the design for
+community feedback, its integrity defenses, and the (deferred) training path;
+its open questions are listed at the bottom and every one is genuinely open.
+If you join now, you are joining a project on day one — with everything that
+implies, good and bad.
 
 You do not need a GPU, and you do not need to be a machine-learning researcher.
 The most valuable early contribution is careful, critical reading.

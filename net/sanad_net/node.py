@@ -1,4 +1,4 @@
-"""Sanad node v0.2 — the polite node.
+"""Sanad node v0.2.1 — the polite node, hardened.
 
 Wraps a ggml-rpc-server process and registers it with the coordinator, with
 "good guest" behavior baked in:
@@ -15,6 +15,15 @@ Wraps a ggml-rpc-server process and registers it with the coordinator, with
   memory returned). When the machine has been calm for a while, it rejoins and
   re-registers automatically. Withdrawal is never punished: credits are kept.
   Set --busy-at 101 for a dedicated (always-on) node.
+
+v0.2.1 hardening (post adversarial review):
+- Sensor failures no longer fail open: an unreadable sample is treated as
+  "unknown" (state kept, streaks reset) instead of 0% load, and a sensor error
+  can never crash the node process.
+- A drained node that cannot reach the coordinator on rejoin stays drained and
+  keeps trying, instead of exiting.
+- The sensor's decision logic lives in a pure, unit-tested state machine
+  (SensorFSM).
 
 Usage:
     python -m sanad_net.node --node-id riyadh-a --operator amina \
@@ -47,29 +56,123 @@ def post(url: str, payload: dict, timeout: float = 10) -> dict:
         return json.loads(resp.read())
 
 
-def total_cpu_percent() -> float:
-    """System-wide CPU load. PowerShell keeps this stdlib-only on Windows."""
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average"],
-        capture_output=True, text=True, timeout=20,
-    ).stdout.strip()
-    try:
-        return float(out)
-    except ValueError:
-        return 0.0
+class CpuSampler:
+    """Native Windows CPU sampling via kernel32 (ctypes) — no subprocesses.
+
+    The first sensor design shelled out to PowerShell; under the exact
+    condition it was meant to detect (a saturated CPU) PowerShell itself
+    starved and timed out, so the sensor went blind precisely when it
+    mattered. GetSystemTimes/GetProcessTimes are microsecond-cheap kernel
+    calls that keep working under any load.
+
+    Loads are measured between consecutive calls (the sensor loop period).
+    Returns None on the first call and on API failure.
+    """
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    def __init__(self) -> None:
+        import ctypes
+        self._ct = ctypes
+        self._k32 = ctypes.windll.kernel32
+        self._prev_sys: tuple[int, int, int] | None = None
+        self._prev_proc: tuple[int, float] | None = None  # (cpu_100ns, wall_ts)
+        import os
+        self._n_cores = os.cpu_count() or 1
+
+    def _filetimes(self, n: int):
+        class FILETIME(self._ct.Structure):
+            _fields_ = [("lo", self._ct.c_uint32), ("hi", self._ct.c_uint32)]
+        return [FILETIME() for _ in range(n)]
+
+    @staticmethod
+    def _val(ft) -> int:
+        return (ft.hi << 32) | ft.lo
+
+    def _system_times(self) -> tuple[int, int, int] | None:
+        idle, kern, user = self._filetimes(3)
+        if not self._k32.GetSystemTimes(self._ct.byref(idle), self._ct.byref(kern), self._ct.byref(user)):
+            return None
+        return self._val(idle), self._val(kern), self._val(user)
+
+    def _proc_cpu_100ns(self, pid: int) -> int | None:
+        handle = self._k32.OpenProcess(self._PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kern, user = self._filetimes(4)
+            ok = self._k32.GetProcessTimes(handle, self._ct.byref(created), self._ct.byref(exited),
+                                           self._ct.byref(kern), self._ct.byref(user))
+            if not ok:
+                return None
+            return self._val(kern) + self._val(user)
+        finally:
+            self._k32.CloseHandle(handle)
+
+    def other_load_percent(self, own_pid: int | None) -> float | None:
+        """CPU load excluding the process `own_pid` (our rpc-server): what the
+        OWNER is using. None until two samples exist or on API failure."""
+        try:
+            sys_now = self._system_times()
+            proc_now = self._proc_cpu_100ns(own_pid) if own_pid else 0
+            now = time.time()
+        except Exception:
+            self._prev_sys = None
+            self._prev_proc = None
+            return None
+        if sys_now is None or proc_now is None:
+            self._prev_sys = None
+            self._prev_proc = None
+            return None
+
+        result: float | None = None
+        if self._prev_sys is not None and self._prev_proc is not None:
+            d_idle = sys_now[0] - self._prev_sys[0]
+            d_kern = sys_now[1] - self._prev_sys[1]
+            d_user = sys_now[2] - self._prev_sys[2]
+            d_total = d_kern + d_user  # kernel time includes idle time
+            d_wall = max(now - self._prev_proc[1], 0.25)
+            if d_total > 0:
+                total_pct = (1.0 - d_idle / d_total) * 100.0
+                own_pct = ((proc_now - self._prev_proc[0]) / 1e7 / d_wall / self._n_cores) * 100.0
+                result = max(total_pct - own_pct, 0.0)
+        self._prev_sys = sys_now
+        self._prev_proc = (proc_now, now)
+        return result
 
 
-def proc_cpu_seconds(pid: int) -> float:
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         f"(Get-Process -Id {pid} -ErrorAction SilentlyContinue).TotalProcessorTime.TotalSeconds"],
-        capture_output=True, text=True, timeout=20,
-    ).stdout.strip()
-    try:
-        return float(out)
-    except ValueError:
-        return 0.0
+class SensorFSM:
+    """Pure politeness state machine. step() returns 'drain', 'rejoin', or None.
+
+    A `load` of None means "sample failed": both streaks reset and no action is
+    taken — the node never changes state on missing information.
+    """
+
+    def __init__(self, busy_at: float, resume_at: float,
+                 busy_samples: int = BUSY_SAMPLES, calm_samples: int = CALM_SAMPLES) -> None:
+        self.busy_at = busy_at
+        self.resume_at = resume_at
+        self.busy_samples = busy_samples
+        self.calm_samples = calm_samples
+        self.busy_streak = 0
+        self.calm_streak = 0
+
+    def step(self, load: float | None, serving: bool) -> str | None:
+        if load is None:
+            self.busy_streak = 0
+            self.calm_streak = 0
+            return None
+        if serving:
+            self.busy_streak = self.busy_streak + 1 if load >= self.busy_at else 0
+            if self.busy_streak >= self.busy_samples:
+                self.busy_streak = 0
+                return "drain"
+        else:
+            self.calm_streak = self.calm_streak + 1 if load <= self.resume_at else 0
+            if self.calm_streak >= self.calm_samples:
+                self.calm_streak = 0
+                return "rejoin"
+        return None
 
 
 class PoliteNode:
@@ -81,18 +184,15 @@ class PoliteNode:
             sys.exit(f"ggml-rpc-server.exe not found in {self.bin_dir}")
         self.proc: subprocess.Popen | None = None
         self.serving = False
-        self.n_cores = self._core_count()
-
-    @staticmethod
-    def _core_count() -> int:
-        import os
-        return os.cpu_count() or 1
+        self.fsm = SensorFSM(args.busy_at, args.resume_at)
+        self.sampler = CpuSampler() if args.busy_at <= 100 else None
 
     def log(self, msg: str) -> None:
         print(f"[{self.args.node_id}] {msg}", flush=True)
 
     # -- rpc-server lifecycle ------------------------------------------------
-    def start_serving(self) -> None:
+    def start_serving(self) -> bool:
+        """Spawn rpc-server and register. Returns False (and cleans up) on failure."""
         creationflags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
         self.proc = subprocess.Popen(
             [str(self.rpc_exe), "-H", self.args.host, "-p", str(self.args.port),
@@ -106,18 +206,18 @@ class PoliteNode:
             "port": self.args.port, "operator": self.args.operator,
             "pledge_mb": self.args.pledge_mb,
         }
-        for _ in range(30):
+        for _ in range(10):
             try:
                 post(f"{self.args.coordinator}/register", payload)
-                break
+                self.serving = True
+                self.log(f"SERVING on {self.args.host}:{self.args.port} "
+                         f"(pledge {self.args.pledge_mb} MB, BELOW_NORMAL priority, "
+                         f"operator {self.args.operator})")
+                return True
             except Exception:
                 time.sleep(1.0)
-        else:
-            self.stop_serving(polite=False)
-            sys.exit(f"could not reach coordinator at {self.args.coordinator}")
-        self.serving = True
-        self.log(f"SERVING on {self.args.host}:{self.args.port} "
-                 f"(pledge {self.args.pledge_mb} MB, BELOW_NORMAL priority, operator {self.args.operator})")
+        self.stop_serving(polite=False)
+        return False
 
     def stop_serving(self, polite: bool = True) -> None:
         if polite:
@@ -130,23 +230,10 @@ class PoliteNode:
             self.proc = None
         self.serving = False
 
-    # -- busy sensor -----------------------------------------------------------
-    def other_load_percent(self) -> float:
-        """CPU load excluding our own rpc-server: what the OWNER is using."""
-        pid = self.proc.pid if self.proc else None
-        c0 = proc_cpu_seconds(pid) if pid else 0.0
-        t0 = time.time()
-        total = total_cpu_percent()  # ~1s sampling call doubles as the interval
-        dt = max(time.time() - t0, 0.25)
-        c1 = proc_cpu_seconds(pid) if pid else 0.0
-        own = ((c1 - c0) / dt / self.n_cores) * 100.0
-        return max(total - own, 0.0)
-
     # -- main loop -------------------------------------------------------------
     def run(self) -> None:
-        self.start_serving()
-        busy_streak = 0
-        calm_streak = 0
+        if not self.start_serving():
+            sys.exit(f"could not reach coordinator at {self.args.coordinator}")
         last_beat = 0.0
         try:
             while True:
@@ -164,20 +251,20 @@ class PoliteNode:
                     time.sleep(SENSOR_PERIOD_S)
                     continue
 
-                load = self.other_load_percent()
-                if self.serving:
-                    busy_streak = busy_streak + 1 if load >= self.args.busy_at else 0
-                    if busy_streak >= BUSY_SAMPLES:
-                        self.log(f"owner is busy (other-process load ~{load:.0f}%) -> "
-                                 "draining out politely, all memory returned")
-                        self.stop_serving()
-                        busy_streak = 0
-                else:
-                    calm_streak = calm_streak + 1 if load <= self.args.resume_at else 0
-                    if calm_streak >= CALM_SAMPLES:
-                        self.log(f"machine calm again (~{load:.0f}%) -> rejoining the network")
-                        self.start_serving()
-                        calm_streak = 0
+                try:
+                    load = self.sampler.other_load_percent(self.proc.pid if self.proc else None)
+                except Exception:
+                    load = None  # a sensor error must never crash the node
+                action = self.fsm.step(load, self.serving)
+                if action == "drain":
+                    self.log(f"owner is busy (other-process load ~{load:.0f}%) -> "
+                             "draining out politely, all memory returned")
+                    self.stop_serving()
+                elif action == "rejoin":
+                    self.log(f"machine calm again (~{load:.0f}%) -> rejoining the network")
+                    if not self.start_serving():
+                        self.log("coordinator unreachable - staying drained, will retry")
+                        self.stop_serving(polite=False)
                 time.sleep(SENSOR_PERIOD_S)
         except KeyboardInterrupt:
             pass

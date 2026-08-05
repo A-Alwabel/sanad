@@ -7,7 +7,7 @@
 **Status: the network is alive (v0.2, 2026-08-05).** Two proven milestones in one day, both with full captured transcripts in [docs/PROOF.md](docs/PROOF.md):
 
 - **First Light** — a real model's layers physically split across two node processes over TCP, real text generated through the chain, credits earned by serving and spent as priority.
-- **The Living Network** — the network now *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it — service never stopped); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself, returning all memory → rejoined by itself when the machine calmed); and credits are **weighted by layer share**, so memory lent equals share earned — with balances fully kept when a node withdraws. Your device, your priority, always.
+- **The Living Network** — the network now *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it — a request submitted after every transition was served); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself, returning all memory → rejoined by itself when the machine calmed); and credits are **weighted by layer share**, so memory lent equals share earned — with balances fully kept when a node withdraws. Your device, your priority, always.
 
 Still day one: single-machine, trusted nodes, small models — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
@@ -56,7 +56,7 @@ Honesty is a design principle here (over-promising is how this field loses trust
     credits ◄───┴───────────────┘ tokens stream back
 ```
 
-- **Workers** register a contiguous layer range they can hold; the **coordinator** assembles the lowest-latency chain that covers the whole model and routes jobs by requester credit priority (anonymous users are always served, at lowest priority — no paywall, ever).
+- **Workers** register a contiguous layer range they can hold; the **coordinator** assembles the lowest-latency chain that covers the whole model and routes jobs by requester credit priority — anonymous users are served within bounded time: every third queue slot is strictly first-come-first-served regardless of credits (anti-starvation), the rest go to contributors first. No paywall, ever.
 - Serving verified tokens **earns credits**; credits buy **priority**, nothing else.
 - Sanad does not reinvent inference: real backends plug in via adapters (llama.cpp RPC, [Parallax](https://github.com/GradientHQ/parallax), [BloomBee](https://github.com/ai-decentralized/BloomBee)). Sanad's contribution is the **network and fairness layer** on top.
 
@@ -66,7 +66,7 @@ Honesty is a design principle here (over-promising is how this field loses trust
 
 ```bash
 cd net
-python -m unittest discover -s tests -v      # 7 tests, no binaries needed
+python -m unittest discover -s tests -v      # unit tests, no binaries needed
 python proof/run_first_light.py              # full network + proof, ends in "FIRST LIGHT: PASS"
 ```
 
@@ -74,7 +74,7 @@ python proof/run_first_light.py              # full network + proof, ends in "FI
 
 ```bash
 cd prototype
-python -m sanad.demo          # watch a "70B" model run across 6 small mock workers
+python -m sanad.demo          # watch a "70B" model run across a fleet of 6 small mock workers (5 selected into the pipeline)
 python -m unittest discover -s tests -v
 ```
 

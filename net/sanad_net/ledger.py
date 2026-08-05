@@ -1,8 +1,13 @@
 """Non-transferable credit ledger (real-network variant).
 
-Same rules as the simulation and GOVERNANCE.md: credits are minted only by
-serving verified tokens, spent only as queue priority, and there is no
-transfer path — deliberately, so credits can never become a tradeable asset.
+Core rules per GOVERNANCE.md: credits are minted only by serving verified
+tokens, spent only as queue priority, and there is no transfer path —
+deliberately, so credits can never become a tradeable asset.
+
+Note: semantics here have intentionally diverged from the prototype/
+simulation — net/ escrows a job's expected cost at submit and settles after
+the run (refunds included), while the simulation spends at completion. net/
+is authoritative; the simulation illustrates concepts.
 """
 
 from __future__ import annotations

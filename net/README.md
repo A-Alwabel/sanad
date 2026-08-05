@@ -19,10 +19,19 @@ transcripts in [proof/artifacts/](proof/artifacts/).
 - **Weighted fairness** — layer shares follow pledges (via `--tensor-split`,
   verified empirically), and each token's credit is split by the layers each
   node actually held.
-- **Chain repair** — a job that fails because a node vanished is retried once
-  against the surviving pipeline.
+- **Anti-starvation queue** — anonymous users are served within bounded time:
+  every third queue slot is strictly first-come-first-served regardless of
+  credits, the rest go to contributors first.
+- **Escrow accounting** — a job's expected cost is escrowed at submit and
+  settled after the run (refund or top-up), so queued jobs can't all borrow
+  the same balance, and cancelled/timed-out jobs are refunded.
+- **Chain repair** (implemented and unit-tested; not yet demonstrated in a
+  recorded milestone) — a job that fails because a node vanished is retried
+  once against the surviving pipeline.
 - **Wallet-style statement** — `client statement --user <name>` prints the
-  audited earn/spend history from `/ledger`.
+  earn/spend history from `/ledger`. Audited in the append-only-ledger sense;
+  client identity is unauthenticated in v0 — a trusted-client assumption,
+  like the trusted-node one.
 
 ## What it is
 
@@ -41,9 +50,9 @@ transcripts in [proof/artifacts/](proof/artifacts/).
 ## Honest scope (read this)
 
 - This first light ran on **one physical machine** — multiple OS processes
-  talking over local TCP. The protocol is network-transparent (the same flags
-  accept remote `host:port`), but the multi-machine, multi-network run is the
-  next milestone, not this one.
+  talking over local TCP. Node flags accept remote `host:port` endpoints and
+  the coordinator now takes `--bind`; the multi-machine run is the next
+  milestone and has not been demonstrated yet.
 - llama.cpp's RPC backend is upstream-labeled **"fragile and insecure — never
   run the rpc-server on an open network"**. Trusted machines only, for now.
   This matches the permissioned-first trust model in
@@ -51,10 +60,11 @@ transcripts in [proof/artifacts/](proof/artifacts/).
 - Each request currently reloads the model (~seconds of overhead): simple and
   stateless, but wasteful — it is also what makes ladder tier-switching free.
   A resident pipeline (llama-server or engine adapters) is listed in next steps.
-- The busy sensor samples CPU via PowerShell (Windows-only for now) and is
-  deliberately simple: sustained other-process load in, drain out; calm in,
-  rejoin. Fullscreen/game detection, battery awareness, and hysteresis tuning
-  are open contributor work.
+- The busy sensor samples CPU via native Windows kernel calls (ctypes
+  GetSystemTimes/GetProcessTimes — subprocess-free, so it keeps working under
+  full load; Windows-only for now) and is deliberately simple: sustained
+  other-process load in, drain out; calm in, rejoin. Fullscreen/game
+  detection, battery awareness, and hysteresis tuning are open contributor work.
 
 ## Setup (Windows)
 
@@ -67,9 +77,9 @@ transcripts in [proof/artifacts/](proof/artifacts/).
 #    -> save into ..\.local\models
 ```
 
-Linux/macOS work the same way with the matching llama.cpp release archives
-(binary names lose the `.exe`; the node wrapper's process handling is
-Windows-tested only so far — reports welcome).
+Windows-only for now: binary names are hardcoded with `.exe` and the busy
+sensor uses Windows kernel APIs. Linux/macOS need small code changes —
+contributions welcome.
 
 ## Run it
 

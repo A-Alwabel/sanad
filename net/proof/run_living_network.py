@@ -30,15 +30,21 @@ COORD = "http://127.0.0.1:7862"
 SMALL = "qwen2.5-0.5b-instruct-q4_k_m"
 LARGE = "qwen2.5-1.5b-instruct-q4_k_m"
 
-HOG_CODE = (
-    "import threading, os\n"
-    "def spin():\n"
-    "    while True: pass\n"
-    "for _ in range(os.cpu_count()):\n"
-    "    threading.Thread(target=spin, daemon=True).start()\n"
-    "import time\n"
-    "time.sleep(3600)\n"
-)
+# One spinning process per core: Python threads share the GIL and can only
+# burn ~one core total, so a convincing "game" needs separate processes.
+HOG_PROCS = None  # set in main from cpu_count
+
+
+def start_hog() -> list[subprocess.Popen]:
+    import os
+    n = os.cpu_count() or 4
+    return [subprocess.Popen([sys.executable, "-c", "while True: pass"])
+            for _ in range(n)]
+
+
+def stop_hog(hogs: list[subprocess.Popen]) -> None:
+    for h in hogs:
+        h.terminate()
 
 
 def call(path: str, payload: dict | None = None, timeout: float = 900) -> dict:
@@ -84,7 +90,7 @@ def main() -> None:
     net_dir = Path(__file__).resolve().parent.parent
 
     procs: list[subprocess.Popen] = []
-    hog: subprocess.Popen | None = None
+    hogs: list[subprocess.Popen] = []
 
     def spawn(mod_args: list[str]) -> subprocess.Popen:
         p = subprocess.Popen([sys.executable, "-m", *mod_args], cwd=str(net_dir))
@@ -125,8 +131,8 @@ def main() -> None:
         bilal_before_leaving = bal["bilal"]
 
         section("5. THE POLITE NODE: owner starts heavy work -> node B drains out on its own")
-        hog = subprocess.Popen([sys.executable, "-c", HOG_CODE])
-        print(f"(cpu hog pid={hog.pid} started at NORMAL priority - simulating the owner's game)")
+        hogs = start_hog()
+        print(f"(cpu hog: {len(hogs)} spinner processes at NORMAL priority - simulating the owner's game)")
         wait_for(lambda: len(call("/status")["nodes"]) == 1, 90, "node B draining out under load")
         st = call("/status")
         print(f"nodes now: {[n['node_id'] for n in st['nodes']]}  model: {st['model']}")
@@ -139,8 +145,8 @@ def main() -> None:
         assert len(r["shard_map"]) == 1, "must be served by the remaining node alone"
 
         section("7. Owner finishes -> machine calm -> node B rejoins BY ITSELF -> LADDER UP again")
-        hog.terminate()
-        hog = None
+        stop_hog(hogs)
+        hogs = []
         print("(cpu hog terminated)")
         wait_for(lambda: len(call("/status")["nodes"]) == 2 and call("/status")["model"] == LARGE,
                  120, "node B rejoining and ladder upgrade")
@@ -162,8 +168,7 @@ def main() -> None:
 
         section("LIVING NETWORK: PASS - ladder + polite node + weighted fairness, end to end")
     finally:
-        if hog is not None:
-            hog.terminate()
+        stop_hog(hogs)
         for p in procs:
             p.terminate()
         subprocess.run(["taskkill", "/F", "/IM", "ggml-rpc-server.exe"], capture_output=True)

@@ -86,7 +86,7 @@ Honesty is a load-bearing design principle here, so this section is not boilerpl
 
 ## Design Principles
 
-1. **Non-tradeable credits, forever.** Contribute compute, earn credits; spend credits for priority; anonymous users always served at lowest priority so the floor of access is zero-cost. Credits can never be bought, sold, or transferred for value, and this is a constitutional commitment, not a launch-phase policy. AI Horde has proven this design sustains a volunteer network for years without speculation. The one thing Petals lacked is the one thing this provides: a durable reason for supply to exist.
+1. **Non-tradeable credits, forever.** Contribute compute, earn credits; spend credits for priority; anonymous users are served within bounded time (a reserved share of scheduling is strictly first-come-first-served) so the floor of access is zero-cost. Credits can never be bought, sold, or transferred for value, and this is a constitutional commitment, not a launch-phase policy. AI Horde has proven this design sustains a volunteer network for years without speculation. The one thing Petals lacked is the one thing this provides: a durable reason for supply to exist.
 
 2. **Honesty about limits.** Every performance claim dated and sourced; every unsolved problem labeled unsolved. WAN latency caps single-stream speed. Activation privacy through untrusted peers is unsolved. Verification is detect-and-eject (TOPLOC-style), not cryptographic proof. A project asking for the public's hardware owes the public the truth about what that hardware buys.
 

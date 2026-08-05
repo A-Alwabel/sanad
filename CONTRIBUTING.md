@@ -4,16 +4,28 @@ Thank you for looking at this. First, an honest statement of where things stand.
 
 ## Where the project is (read this first)
 
-Sanad is at **Phase 0**. As of August 2026 there is no running network, no client
-to install, and no credits to earn. What exists is a design (an RFC and concept
-documents), a small prototype simulator, and a set of hard open problems that we
-name plainly instead of hiding. We are looking for **founding contributors**:
-people who want to argue the design into shape, do the research, and build the
-first working pieces. If you join now, you are joining a project on day one —
-with everything that implies, good and bad.
+Sanad is young, but no longer hypothetical. On 2026-08-05 the first two
+milestones shipped with recorded proofs ([docs/PROOF.md](docs/PROOF.md)):
+**v0.1 First Light** — a real model's layers physically split across two node
+processes over TCP, credits earned by serving — and **v0.2 The Living
+Network** — a capacity ladder, a polite node that yields to its owner, and
+layer-share-weighted credits. The real network layer lives in [`net/`](net/)
+and is Windows-first for now. Beyond that, what exists is a design (an RFC and
+concept documents), a small prototype simulator, and a set of hard open
+problems that we name plainly instead of hiding. Everything so far has run on
+one physical machine with trusted nodes and small models; there is still no
+network you can join from home.
+
+We are looking for **founding contributors**: people who want to argue the
+design into shape, do the research, and build the next working pieces.
+Contributions are currently most valuable in four places: multi-machine
+testing, a Linux/macOS port of `net/` (binary names are hardcoded with `.exe`
+and the busy sensor shells out to PowerShell), tests, and review of the
+upcoming human-loop RFC. If you join now, you are joining a project on day
+one — with everything that implies, good and bad.
 
 You do not need a GPU, and you do not need to be a machine-learning researcher.
-The most valuable Phase 0 contribution is careful, critical reading.
+The most valuable early contribution is careful, critical reading.
 
 ## Ways to contribute right now
 

@@ -1,6 +1,8 @@
 # Sanad v0 Architecture
 
-> Status: DRAFT / RFC. Nothing described here is running yet. All external claims are
+> Status: DRAFT / RFC. A first implementation of the coordinator/node/ledger design
+> below now runs in [net/](../net/) (see [PROOF.md](PROOF.md)); the federation,
+> audit, and privacy sections remain design-stage. All external claims are
 > "as of August 2026" and cited. Corrections welcome — file an issue.
 
 Sanad combines two proven-but-never-combined ideas:
@@ -169,8 +171,10 @@ points = tokens_processed × model_class_weight × latency_tier_weight
   tunable by open governance, never by hidden code.
 
 **Spending.** Points buy **queue priority only**. They are not money, not a claim on
-anything, and never expire. Anonymous use is allowed at lowest priority — like AI Horde,
-Sanad must be usable by people who cannot contribute.
+anything, and never expire. Anonymous use is allowed and served within bounded time —
+every third queue slot is strictly first-come-first-served regardless of credits
+(anti-starvation), the rest go to contributors first. Like AI Horde, Sanad must be
+usable by people who cannot contribute.
 
 **Non-tradeable by Terms of Service.** Copying AI Horde's proven rule verbatim in
 spirit: points may be gifted, but buying or selling them is banned and enforced by ToS.

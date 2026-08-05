@@ -92,7 +92,11 @@ def main() -> None:
         assert status["balances"].get("amina", 0) > 0
         assert status["balances"].get("bilal", 0) > 0
 
-        section("4. Priority: contributor (amina) vs anonymous (zed), submitted after her queue rival")
+        section("4. Fair scheduling: credits buy priority, and nobody starves")
+        # v0.2.1 scheduler: contributor priority on most slots, but every third
+        # slot is strictly first-come-first-served (anti-starvation). So a
+        # contributor overtakes SOME anonymous rivals, while every anonymous
+        # job is still served within bounded time.
         results: list[tuple[str, float]] = []
         lock = threading.Lock()
 
@@ -103,25 +107,28 @@ def main() -> None:
 
         threads = [threading.Thread(target=ask, args=("anon", "The sun is"))]
         threads[0].start()
-        time.sleep(1.0)  # filler job is now running; next two land in the queue
-        t_zed = threading.Thread(target=ask, args=("zed", "Water boils at"))
-        t_zed.start()
-        time.sleep(0.3)  # zed is queued FIRST...
-        t_amina = threading.Thread(target=ask, args=("amina", "The moon orbits"))
-        t_amina.start()  # ...amina second, but she has credits
-        for t in [*threads, t_zed, t_amina]:
+        time.sleep(1.0)  # filler job is now running; the rest land in the queue
+        for user, prompt in [("zed", "Water boils at"), ("zed2", "Ice melts at"),
+                             ("amina", "The moon orbits")]:  # amina queued LAST
+            t = threading.Thread(target=ask, args=(user, prompt))
+            t.start()
+            threads.append(t)
+            time.sleep(0.3)
+        for t in threads:
             t.join(timeout=900)
 
         print("completion order (user, priority_at_submit):")
         for user, prio in results:
             print(f"  {user:8s} priority={prio}")
         order = [u for u, _ in results]
-        assert order.index("amina") < order.index("zed"), (
-            "amina (contributor) should be served before zed (anonymous) "
-            "even though zed was queued first"
+        overtaken = sum(1 for z in ("zed", "zed2") if order.index("amina") < order.index(z))
+        assert overtaken >= 1, (
+            "amina (contributor, queued last) should overtake at least one "
+            "anonymous rival - credits must buy priority"
         )
-        print("-> amina was queued AFTER zed but served BEFORE him: credits buy priority.")
-        print("-> zed (anonymous, zero credits) was still served: priority, never access.")
+        assert {"zed", "zed2"} <= set(order), "every anonymous user must be served"
+        print(f"-> amina was queued LAST yet overtook {overtaken} anonymous rival(s): credits buy priority.")
+        print("-> every anonymous job was still served (every 3rd slot is FIFO): priority, never access.")
 
         section("5. Final network state")
         print(json.dumps(call("/status"), indent=2))

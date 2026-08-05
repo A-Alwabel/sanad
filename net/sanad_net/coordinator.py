@@ -1,24 +1,29 @@
-"""Sanad coordinator v0.2 — "the living network".
+"""Sanad coordinator v0.2.1 — "the living network", hardened.
 
-Adds to v0.1 (First Light):
-- **Capacity ladder**: a catalog of models; the coordinator always serves the
-  largest model the current pool of pledged memory can hold, upgrading when
-  nodes join and downgrading when they leave. The network grows as its
-  community grows.
-- **Memory pledges**: nodes declare how much RAM they lend; layer shares are
-  enforced proportionally via llama.cpp's --tensor-split (verified empirically:
-  a 3,1 split yields ~3:1 layer assignment).
-- **Layer-share weighted credits**: each generated token mints 1 credit split
-  by the share of model layers each node actually held (memory lent == share
-  earned), replacing v0.1's even split.
-- **Graceful membership**: /leave endpoint for polite nodes draining out;
-  chain repair — a job that fails because a node vanished is retried once with
-  the surviving pipeline.
-- **Wallet-style statement**: /ledger returns the full audited entry history.
+v0.2 added: capacity ladder, memory pledges, layer-share weighted credits,
+graceful membership, wallet-style statement.
 
-Still honest v0: centralized-but-open coordinator, trusted operators, one
-inference at a time, model reloaded per request (which is precisely what makes
-ladder switching free). See docs/ARCHITECTURE.md.
+v0.2.1 hardens the scheduler and accounting after an adversarial review:
+- **Anti-starvation**: every third queue slot is served strictly
+  first-come-first-served regardless of credits, so zero-credit users are
+  served within bounded time even under sustained contributor load.
+- **Escrow accounting**: a job's expected cost (max_tokens) is escrowed at
+  submit and settled after the run (refund or nothing further); cancelled,
+  timed-out, and failed jobs are refunded. Concurrent jobs can no longer all
+  inherit priority from the same unspent balance.
+- **Cancellation**: a job whose submitter timed out waiting is skipped (and
+  refunded) instead of running unobserved and charging for a discarded result.
+- **Distinct failures**: CapacityError (no nodes / pool too small) fails fast;
+  ChainFailure (pipeline execution failed, incl. engine timeout) triggers one
+  repair retry that first evicts pipeline nodes with no heartbeat since the
+  job started, then waits past a heartbeat period so live nodes re-appear.
+- **Accounting guard**: if the engine log cannot prove who served which
+  layers, nobody is charged and nobody is paid — an event records the loss.
+- **Thread-safe ladder events**; /status no longer mutates the event log.
+
+Still honest v0: centralized-but-open coordinator, trusted operators and
+trusted clients (identity unauthenticated), one inference at a time, model
+reloaded per request. See docs/ARCHITECTURE.md.
 
 Usage:
     python -m sanad_net.coordinator --port 7860 \
@@ -30,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import queue
 import re
 import subprocess
 import threading
@@ -43,6 +47,20 @@ from .ledger import Ledger
 
 NODE_TTL_S = 15.0          # node considered dead if no heartbeat within this window
 POOL_SAFETY_FACTOR = 1.4   # model needs file_size * factor of pooled memory (KV + overhead)
+
+
+class CapacityError(RuntimeError):
+    """No pipeline can be built (no nodes, or pool too small). Not repairable."""
+
+
+class ChainFailure(RuntimeError):
+    """The assembled pipeline failed to execute. Repairable once.
+
+    May carry `node_ids` (the pipeline that failed) and `job_start_ts`.
+    """
+
+    node_ids: list[str] = []
+    job_start_ts: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -92,6 +110,18 @@ class Registry:
         """Graceful exit: the polite node drains out with zero penalty."""
         with self._lock:
             return self._nodes.pop(node_id, None) is not None
+
+    def suspect(self, node_id: str) -> None:
+        """Mark a node dead-until-next-heartbeat (used after a chain failure)."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is not None:
+                node["last_seen"] = 0.0
+
+    def last_seen(self, node_id: str) -> float:
+        with self._lock:
+            node = self._nodes.get(node_id)
+            return node["last_seen"] if node else 0.0
 
     def alive(self) -> list[dict]:
         now = time.time()
@@ -181,18 +211,24 @@ class InferenceRunner:
             "-v",  # verbose: exposes per-layer device assignment for the shard map
         ]
         t0 = time.time()
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=600, cwd=str(self.bin_dir),
-        )
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=600, cwd=str(self.bin_dir),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ChainFailure(f"llama-completion timed out after 600s") from exc
         wall_s = time.time() - t0
         if proc.returncode != 0:
-            raise RuntimeError(f"llama-completion failed (rc={proc.returncode}): {proc.stderr[-800:]}")
+            raise ChainFailure(f"llama-completion failed (rc={proc.returncode}): {proc.stderr[-800:]}")
         stats = parse_llama_log(proc.stderr)
         return {"text": proc.stdout.strip(), "wall_s": round(wall_s, 2), **stats}
 
 
 class Coordinator:
+    RETRY_DELAY_S = 4.0        # > heartbeat period, so live nodes re-appear before the retry
+    FIFO_EVERY = 3             # every Nth slot is strictly first-come-first-served
+
     def __init__(self, runner: InferenceRunner, catalog: list[ModelTier]) -> None:
         self.registry = Registry()
         self.ledger = Ledger()
@@ -201,100 +237,164 @@ class Coordinator:
         self.jobs_done = 0
         self.events: list[dict] = []
         self._last_tier: str | None = None
-        self._queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._tier_lock = threading.Lock()
+        self._pending: list[dict] = []
+        self._cv = threading.Condition()
+        self._served = 0
         self._seq = 0
-        self._seq_lock = threading.Lock()
         threading.Thread(target=self._worker_loop, daemon=True).start()
 
     # -- capacity ladder -----------------------------------------------------
-    def current_tier(self) -> tuple[ModelTier | None, list[dict], float]:
+    def _compute_tier(self) -> tuple[ModelTier | None, list[dict], float]:
+        """Pure: no event emission. Safe for /status."""
         nodes = self.registry.alive()
         pool_mb = sum(n["pledge_mb"] for n in nodes)
-        tier = pick_tier(self.catalog, pool_mb)
+        return pick_tier(self.catalog, pool_mb), nodes, pool_mb
+
+    def current_tier(self) -> tuple[ModelTier | None, list[dict], float]:
+        tier, nodes, pool_mb = self._compute_tier()
         name = tier.name if tier else None
-        if name != self._last_tier:
-            direction = "UP" if (
-                self._last_tier is None
-                or (tier and any(t.name == self._last_tier and t.file_mb < tier.file_mb for t in self.catalog))
-            ) else "DOWN"
-            self._event(f"LADDER {direction}: model -> {name or 'none fits'} "
-                        f"(pool {pool_mb:.0f} MB across {len(nodes)} nodes)")
-            self._last_tier = name
+        with self._tier_lock:
+            if name != self._last_tier:
+                direction = "UP" if (
+                    self._last_tier is None
+                    or (tier and any(t.name == self._last_tier and t.file_mb < tier.file_mb for t in self.catalog))
+                ) else "DOWN"
+                self._event(f"LADDER {direction}: model -> {name or 'none fits'} "
+                            f"(pool {pool_mb:.0f} MB across {len(nodes)} nodes)")
+                self._last_tier = name
         return tier, nodes, pool_mb
 
     def _event(self, msg: str) -> None:
         self.events.append({"ts": round(time.time(), 2), "event": msg})
 
     # -- job scheduling ------------------------------------------------------
-    def submit(self, user: str, prompt: str, max_tokens: int) -> dict:
-        """Blocking: enqueue with credit priority, wait for this job's result."""
-        with self._seq_lock:
+    def submit(self, user: str, prompt: str, max_tokens: int, timeout_s: float = 900.0) -> dict:
+        """Blocking: enqueue with credit priority (escrowed), wait for the result."""
+        with self._cv:
             self._seq += 1
             seq = self._seq
         priority = -self.ledger.balance(user)  # higher balance -> served first
-        done = threading.Event()
-        slot: dict = {}
-        self._queue.put((priority, seq, user, prompt, max_tokens, done, slot))
-        done.wait(timeout=900)
-        if not done.is_set():
+        escrow = self.ledger.spend(user, float(max_tokens), f"escrow for job #{seq}")
+        job = {
+            "seq": seq, "priority": priority, "user": user, "prompt": prompt,
+            "max_tokens": max_tokens, "escrow": escrow,
+            "done": threading.Event(), "slot": {}, "cancelled": False, "started": False,
+        }
+        with self._cv:
+            self._pending.append(job)
+            self._cv.notify()
+        job["done"].wait(timeout=timeout_s)
+        if not job["done"].is_set():
+            with self._cv:
+                if not job["started"]:
+                    job["cancelled"] = True
+                    if escrow > 0:
+                        self.ledger.earn(user, escrow, f"escrow refund (job #{seq} timed out in queue)")
             raise TimeoutError("job timed out in queue")
-        if "error" in slot:
-            raise RuntimeError(slot["error"])
-        return slot["result"]
+        if "error" in job["slot"]:
+            raise RuntimeError(job["slot"]["error"])
+        return job["slot"]["result"]
+
+    def _pop_next_locked(self) -> dict:
+        """Pick the next job. Every FIFO_EVERY-th slot is strictly by arrival
+        order — the anti-starvation reserve that keeps zero-credit users moving."""
+        self._served += 1
+        if self._served % self.FIFO_EVERY == 0:
+            job = min(self._pending, key=lambda j: j["seq"])
+        else:
+            job = min(self._pending, key=lambda j: (j["priority"], j["seq"]))
+        self._pending.remove(job)
+        return job
 
     def _worker_loop(self) -> None:
         while True:
-            priority, seq, user, prompt, max_tokens, done, slot = self._queue.get()
+            with self._cv:
+                while not self._pending:
+                    self._cv.wait()
+                job = self._pop_next_locked()
+                if job["cancelled"]:
+                    self._event(f"job #{job['seq']} cancelled before start - skipped (escrow refunded)")
+                    job["done"].set()
+                    continue
+                job["started"] = True
             try:
-                slot["result"] = self._run_job_with_repair(user, prompt, max_tokens, priority)
+                job["slot"]["result"] = self._run_job_with_repair(job)
             except Exception as exc:
-                slot["error"] = f"{type(exc).__name__}: {exc}"
+                job["slot"]["error"] = f"{type(exc).__name__}: {exc}"
+                if job["escrow"] > 0:
+                    self.ledger.earn(job["user"], job["escrow"],
+                                     f"escrow refund (job #{job['seq']} failed)")
             finally:
-                done.set()
+                job["done"].set()
 
-    def _run_job_with_repair(self, user: str, prompt: str, max_tokens: int, priority: float) -> dict:
-        """Chain repair: if the pipeline fails (e.g. a node vanished mid-job),
-        rebuild from surviving nodes and retry once."""
+    def _run_job_with_repair(self, job: dict) -> dict:
+        """Chain repair: on pipeline failure, evict nodes with no heartbeat since
+        the job started (likely dead), wait past a heartbeat period so live
+        nodes re-appear, and retry once with the survivors. Capacity errors
+        fail fast — retrying cannot create nodes."""
         try:
-            return self._run_job(user, prompt, max_tokens, priority)
-        except RuntimeError:
-            self._event("chain failed - rebuilding pipeline from surviving nodes and retrying")
-            time.sleep(1.0)
-            return self._run_job(user, prompt, max_tokens, priority, repaired=True)
+            return self._run_job(job)
+        except ChainFailure as exc:
+            stale = [nid for nid in exc.node_ids
+                     if self.registry.last_seen(nid) < exc.job_start_ts]
+            for nid in stale:
+                self.registry.suspect(nid)
+            self._event(f"chain failed - suspected {stale or 'no'} stale nodes; "
+                        "retrying with survivors")
+            time.sleep(self.RETRY_DELAY_S)
+            return self._run_job(job, repaired=True)
 
-    def _run_job(self, user: str, prompt: str, max_tokens: int, priority: float,
-                 repaired: bool = False) -> dict:
+    def _run_job(self, job: dict, repaired: bool = False) -> dict:
         tier, nodes, pool_mb = self.current_tier()
         if not nodes:
-            raise RuntimeError("no live nodes registered - start sanad_net.node first")
+            raise CapacityError("no live nodes registered - start sanad_net.node first")
         if tier is None:
-            raise RuntimeError(f"pool of {pool_mb:.0f} MB cannot hold any catalog model")
+            raise CapacityError(f"pool of {pool_mb:.0f} MB cannot hold any catalog model")
 
         rpc_servers = [f"{n['host']}:{n['port']}" for n in nodes]
         tensor_split = [n["pledge_mb"] for n in nodes]  # layer share follows the pledge
-        result = self.runner.run(tier.path, prompt, rpc_servers, tensor_split, max_tokens)
+        job_start_ts = time.time()
+        try:
+            result = self.runner.run(tier.path, job["prompt"], rpc_servers,
+                                     tensor_split, job["max_tokens"])
+        except ChainFailure as exc:
+            exc.node_ids = [n["node_id"] for n in nodes]
+            exc.job_start_ts = job_start_ts
+            raise
 
         # Layer-share weighted credits: memory lent == layers held == share earned.
         tokens = result["decode_tokens"]
         shard_map = result.get("shard_map", {})
-        total_layers = sum(d["n_layers"] for d in shard_map.values()) or 1
-        if tokens > 0:
+        known_devices = {f"RPC{i}" for i in range(len(nodes))}
+        provable = tokens > 0 and shard_map and set(shard_map) <= known_devices
+        if provable:
+            total_layers = sum(d["n_layers"] for d in shard_map.values())
             # RPC device order follows the --rpc list order == `nodes` order.
             for i, n in enumerate(nodes):
-                dev = f"RPC{i}"
-                n_layers = shard_map.get(dev, {}).get("n_layers", 0)
+                n_layers = shard_map.get(f"RPC{i}", {}).get("n_layers", 0)
                 share = tokens * (n_layers / total_layers)
                 if share > 0:
                     self.ledger.earn(
                         n["operator"], round(share, 3),
                         f"served {n_layers}/{total_layers} layers of {tier.name} for {tokens} tokens via {n['node_id']}",
                     )
-            self.ledger.spend(user, float(tokens), f"inference of {tokens} tokens on {tier.name}")
+            # Settle escrow: refund the unused part; low-balance users owe nothing more.
+            refund = job["escrow"] - float(tokens)
+            if refund > 0:
+                self.ledger.earn(job["user"], refund, f"escrow refund (job #{job['seq']} used {tokens} tokens)")
+        else:
+            # Unproven serving is unpaid serving — and an uncharged request.
+            if job["escrow"] > 0:
+                self.ledger.earn(job["user"], job["escrow"],
+                                 f"escrow refund (job #{job['seq']}: shard map unprovable)")
+            self._event(f"WARNING job #{job['seq']}: engine log unprovable "
+                        f"(tokens={tokens}, devices={sorted(shard_map)}) - no credits minted or charged")
         self.jobs_done += 1
         return {
-            "user": user,
+            "user": job["user"],
             "model": tier.name,
-            "priority_at_submit": -priority,
+            "priority_at_submit": -job["priority"],
             "repaired": repaired,
             "pool_mb": round(pool_mb, 1),
             "pipeline": [
@@ -306,7 +406,7 @@ class Coordinator:
         }
 
     def status(self) -> dict:
-        tier, nodes, pool_mb = self.current_tier()
+        tier, nodes, pool_mb = self._compute_tier()
         return {
             "model": tier.name if tier else None,
             "pool_mb": round(pool_mb, 1),
@@ -381,6 +481,8 @@ def make_handler(coord: Coordinator):
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sanad coordinator")
     ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="bind address (default loopback; anything else is at your own risk in v0)")
     ap.add_argument("--models", required=True,
                     help="comma-separated GGUF paths, the capacity-ladder catalog")
     ap.add_argument("--llama-bin", required=True, help="directory containing llama-completion.exe")
@@ -389,9 +491,13 @@ def main() -> None:
     catalog = load_catalog(args.models.split(","))
     runner = InferenceRunner(Path(args.llama_bin).resolve())
     coord = Coordinator(runner, catalog)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(coord))
+    if args.bind != "127.0.0.1":
+        print("[sanad-coordinator] WARNING: binding beyond loopback — v0 has no "
+              "authentication and llama.cpp's RPC backend is not hardened. "
+              "Trusted networks only.")
+    server = ThreadingHTTPServer((args.bind, args.port), make_handler(coord))
     tiers = " -> ".join(f"{t.name} (needs {t.need_mb:.0f} MB)" for t in catalog)
-    print(f"[sanad-coordinator] http://127.0.0.1:{args.port}  ladder: {tiers}")
+    print(f"[sanad-coordinator] http://{args.bind}:{args.port}  ladder: {tiers}")
     server.serve_forever()
 
 

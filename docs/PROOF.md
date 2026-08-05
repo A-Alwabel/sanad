@@ -19,6 +19,13 @@ TCP, requests flowing through the chain, and the credit ledger doing exactly
 what [GOVERNANCE.md](../GOVERNANCE.md) promises — contribution buys priority,
 and nobody is ever locked out.
 
+> **A note on the transcript.** The First Light transcript was captured on the
+> v0.1 code, which split credits evenly across nodes and used the pre-ladder
+> response schema. Re-running the script on the current (v0.2+) code still
+> passes, but the output differs slightly: credit amounts are weighted by each
+> node's layer share rather than split evenly, and responses carry a `model`
+> field.
+
 ## Environment
 
 | Component | Version / detail |
@@ -44,9 +51,11 @@ returned with every answer (from the transcript):
 }
 ```
 
-Layers 0–12 lived in one node's process, layers 13–24 in the other's. Neither
-process ever held the whole model. During generation, activations crossed TCP
-between them for every token.
+Layers 0–12 lived in one node's process, layers 13–24 in the other's; during
+generation, activations crossed TCP between them for every token. Neither node
+process ever held the whole model in memory — though, to be fully honest, the
+coordinator's machine stores the full GGUF and streams each node's shard to it
+over TCP on every request; distributing model *storage* is future work.
 
 ### 2. Real text came out the other end
 
@@ -56,7 +65,7 @@ Prompt (anonymous user): `A mining pool is` →
 > data processing tasks. They are often used in the mining industry to increase
 > the speed and efficiency of mining"
 
-31 decode tokens at **~37–44 tok/s** across runs (CPU-only, two-node chain,
+31 decode tokens at **43.7 tok/s** (captured run; CPU-only, two-node chain,
 loopback TCP; this number exists to be honest, not to impress — WAN latency
 will cut it hard, see [ARCHITECTURE.md](ARCHITECTURE.md)).
 
@@ -91,8 +100,12 @@ completion order (user, priority_at_submit):
 - **Not private:** activations are readable by the nodes they pass through —
   the field-wide unsolved problem (arXiv 2503.09291) documented in
   [ARCHITECTURE.md](ARCHITECTURE.md).
-- **Not efficient:** the model reloads per request (~4 s overhead); a resident
-  pipeline is next.
+- **Not distributed storage:** the coordinator's machine holds the full GGUF
+  file and streams each node's shard to it over TCP on every request. Nodes
+  lend memory and compute, not storage; distributing model storage is future
+  work.
+- **Not efficient:** the model reloads per request (~5–6 s overhead, derived
+  from the captured wall times); a resident pipeline is next.
 - **Not big:** 0.5B parameters. Chosen so the proof is cheap to reproduce
   anywhere. The identical mechanism loads 70B-class models across enough nodes
   (llama.cpp splits by each node's reported free memory).
@@ -101,13 +114,18 @@ completion order (user, priority_at_submit):
 
 ```powershell
 cd net
-python -m unittest discover -s tests -v        # 7 unit tests, no binaries needed
+python -m unittest discover -s tests -v        # unit tests, no binaries needed
 python proof/run_first_light.py --llama-bin ../.local/bin `
     --model ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
 Setup for the binaries and model: [net/README.md](../net/README.md). The
-script asserts every claim above and exits with `FIRST LIGHT: PASS`.
+script asserts, specifically: the model is sharded across at least two
+devices; decode tokens were produced; both operators' balances are positive;
+the contributor queued last overtook at least one anonymous rival (credits buy
+priority); and every anonymous user was still served (under the v0.2.1 hybrid
+scheduler, every third slot is strictly first-come-first-served). Then it
+exits with `FIRST LIGHT: PASS`.
 
 ---
 
@@ -131,8 +149,10 @@ LADDER DOWN: model -> qwen2.5-0.5b... (pool 1000 MB across 1 nodes)   <- node B 
 LADDER UP:   model -> qwen2.5-1.5b... (pool 1700 MB across 2 nodes)   <- node B returned
 ```
 
-Service never stopped during any transition — per-request model loading makes
-tier switching free.
+A request submitted after every transition was served (per-request model
+loading means there is no warm state to lose). The window where no tier fits —
+too little pledged memory for even the smallest catalog model — is a known
+gap.
 
 ## B. The polite node — the owner always comes first
 

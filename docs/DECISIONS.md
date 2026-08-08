@@ -128,6 +128,20 @@ it did not perform. · Replaced a check that was reassuring rather than true.
 Small, but this project's whole claim is that its numbers can be trusted. ·
 Corrected as found.
 
+**"Still one machine" → two isolated networks (v0.5)** · Every proof through
+v0.4 ran on one host, which left the project's central claim untested. Nodes
+now run in separate Linux containers on separate Docker networks that cannot
+reach each other; only the coordinator bridges them. · Replaced an emulation
+gap we had been honest about but had not closed. The remaining gap — two real
+ISPs — has a written free path in [net/deploy/README.md](../net/deploy/README.md).
+
+**Measured the WAN cost instead of predicting it** · We had been citing a
+published figure (~9 tok/s for a 7B at 80 ms RTT) as our expectation. With
+`tc netem` on the container links we now have our own number: 31.3 → 4.2 tok/s,
+a 7.5x slowdown at 40 ms per link. · Replaced a borrowed estimate with a
+measurement of our own system, which also quantifies the design's central
+tension: the models that most need sharding are the ones that shard worst.
+
 ---
 
 ## Deliberate non-decisions

@@ -1,6 +1,6 @@
 # Proofs that Sanad works
 
-Three milestones, all fully reproducible:
+Five milestones, all fully reproducible:
 
 | Milestone | What it proves | Transcript | Reproduce |
 |---|---|---|---|
@@ -8,6 +8,7 @@ Three milestones, all fully reproducible:
 | **Part 2 — The Living Network** (v0.2) | Capacity ladder + polite node + weighted fairness | [living-network transcript](../net/proof/artifacts/living-network-2026-08-05.txt) | [run_living_network.py](../net/proof/run_living_network.py) |
 | **Part 3 — It Works** (v0.3) | Resident pipeline, live streaming, chat UI, real LAN | [it-works transcript](../net/proof/artifacts/it-works-2026-08-08.txt) | [run_it_works.py](../net/proof/run_it_works.py) |
 | **Part 4 — Usable Together** (v0.4) | One-command join, conversation memory, durable credits, concurrency | [v0.4 transcript](../net/proof/artifacts/v04-2026-08-08.txt) | [run_v04.py](../net/proof/run_v04.py) |
+| **Part 5 — Two Networks** (v0.5) | Sharding across genuinely isolated networks; WAN cost measured | [two-networks transcript](../net/proof/artifacts/two-networks-2026-08-08.txt) | [run_two_networks.py](../net/proof/run_two_networks.py) |
 
 ---
 
@@ -343,3 +344,79 @@ queue tests therefore run against a deliberately single-slot server.
 
 Two nodes on **two different machines on two different networks**, same proofs
 — then federation, then the audit hooks from the roadmap.
+
+
+---
+
+# Part 5 — Two Networks (v0.5)
+
+**Date:** 2026-08-08 · **Status:** PASS · **Raw transcript:** [net/proof/artifacts/two-networks-2026-08-08.txt](../net/proof/artifacts/two-networks-2026-08-08.txt) · **Reproduce:** `python net/proof/run_two_networks.py` (needs Docker)
+
+Parts 1–4 all carried the same caveat: *still one machine*. This one removes
+most of it. Each node runs in its own Linux container on its own Docker
+network, with its own IP and its own network namespace. The coordinator is
+multi-homed across both; the nodes are not.
+
+## A. The networks really are separate
+
+```
+node-a lives at 172.28.0.3
+node-b lives at 172.29.0.3
+node-a trying to reach node-b directly -> socket.gaierror: Name or service not known
+```
+
+node-a cannot even *resolve* node-b, let alone connect to it. Only the
+coordinator bridges the two — which is precisely Sanad's topology, now enforced
+by the network rather than by convention.
+
+## B. Real sharded inference across them
+
+```
+RPC0  node-a:50070  layers 0-17  (18 layers)
+RPC1  node-b:50070  layers 18-28  (11 layers)
+text: A mining pool is a type of decentralized cryptocurrency mining service...
+```
+
+The 1.5B model is split across two isolated networks and answers correctly.
+This also exercises the **Linux** node path — `/proc` CPU sensing, `nice(10)`,
+no `.exe` suffix — which every earlier proof skipped.
+
+## C. The WAN cost, measured rather than assumed
+
+40 ms of latency injected on each link with `tc netem`:
+
+```
+local-network baseline: 31.3 tok/s
+under WAN latency:       4.2 tok/s  (first token 4.26s)
+-> 7.5x slower
+```
+
+This is the number that matters most, and it is not flattering. Splitting a
+model across a network means **every token crosses every hop**, so latency
+multiplies by chain length. It is the honest measurement of the tension at the
+centre of this design: the models that most need sharding are the ones that
+shard worst. Sanad exists to run models **too big for one device** — not to be
+fast. Anyone who wants speed should use a centralized provider, and our own
+documentation says so.
+
+## D. Credits, weighted across networks
+
+`{'amina': 109.9, 'bilal': 67.1}` — node-a held 18 of 29 layers and earned
+proportionally more. Memory lent equals share earned, across a network
+boundary.
+
+## What Part 5 still does not prove
+
+- **Not two ISPs.** Separate networks and namespaces on one physical host is
+  not the same as two homes, two routers, and public routing. NAT traversal and
+  real internet paths remain untested. [net/deploy/README.md](../net/deploy/README.md)
+  documents the free way to do that (a no-cost cloud VM joined by a private
+  WireGuard mesh) and why the RPC port must never face the open internet.
+- **Still centrally coordinated.** Compute is distributed; the control plane is
+  not. Federation is the intended path and is not built.
+- Trust and privacy caveats from Part 1 are unchanged.
+
+## Next milestone
+
+The same proof with the second node on a free cloud VM across the public
+internet — the guide is written, the run is not yet recorded.

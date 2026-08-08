@@ -1,0 +1,129 @@
+# Sanad across a real network, without buying a second machine.
+#
+# Three containers, and crucially TWO separate networks:
+#   - node-a lives only on net-a (172.28.0.0/16)
+#   - node-b lives only on net-b (172.29.0.0/16)
+#   - the coordinator is multi-homed onto both, and is the ONLY thing that can
+#     reach either node. The two nodes cannot see each other at all.
+#
+# Each container is its own OS process tree with its own network namespace and
+# its own IP, so traffic between the coordinator and a node crosses a routed
+# TCP hop through the Docker bridge — not shared memory, not loopback. It is
+# the honest local stand-in for "two machines on two networks", and it also
+# exercises the Linux node path (native /proc CPU sensing, nice(10)) that the
+# Windows proofs never touch.
+#
+#   docker compose -f net/deploy/docker-compose.yml up --build
+#   then run: python net/proof/run_two_networks.py
+
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    command:
+      - python
+      - -m
+      - sanad_net.coordinator
+      - --port
+      - "7860"
+      - --bind
+      - "0.0.0.0"
+      - --models
+      - /models/qwen2.5-0.5b-instruct-q4_k_m.gguf,/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+      - --llama-bin
+      - /opt/llama
+      - --engine-port
+      - "7970"
+      - --ledger
+      - /data/ledger.jsonl
+      - --concurrency
+      - "2"
+      - --no-discovery
+    volumes:
+      - ../../.local/models:/models:ro
+      - sanad-data:/data
+    ports:
+      - "7860:7860"          # so the browser and the proof on the host can reach it
+    networks:
+      - net-a
+      - net-b
+
+  node-a:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    command:
+      - python
+      - -m
+      - sanad_net.node
+      - --node-id
+      - node-a
+      - --operator
+      - amina
+      - --host
+      - "0.0.0.0"
+      - --advertise
+      - node-a               # Docker DNS name the coordinator dials on net-a
+      - --port
+      - "50070"
+      - --pledge-mb
+      - "1000"
+      - --busy-at
+      - "101"                # dedicated: the container has no "owner" to yield to
+      - --coordinator
+      - http://coordinator:7860
+      - --rpc-bin
+      - /opt/llama
+    cap_add:
+      - NET_ADMIN            # lets us add tc netem latency to emulate a WAN link
+    depends_on:
+      - coordinator
+    networks:
+      - net-a
+
+  node-b:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    command:
+      - python
+      - -m
+      - sanad_net.node
+      - --node-id
+      - node-b
+      - --operator
+      - bilal
+      - --host
+      - "0.0.0.0"
+      - --advertise
+      - node-b
+      - --port
+      - "50070"
+      - --pledge-mb
+      - "700"
+      - --busy-at
+      - "101"
+      - --coordinator
+      - http://coordinator:7860
+      - --rpc-bin
+      - /opt/llama
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - coordinator
+    networks:
+      - net-b
+
+networks:
+  net-a:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+  net-b:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+volumes:
+  sanad-data:

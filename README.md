@@ -4,14 +4,16 @@
 
 **Sanad** (Arabic: *سند*, "support" — and the classical term for the **chain of transmission** that carries knowledge from person to person, each link vouching for the next) is a community inference network for large open-weight language models. Nodes each hold a *slice* of a model's layers; chained together, they serve models none of them could run alone. Contributing compute earns **non-tradeable credits** that give you priority when you use the network.
 
-**Status: usable together (v0.4).** Four proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
+**Status: proven across separate networks (v0.5).** Five proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
 
 - **First Light** — a real model's layers physically split across two node processes over TCP, real text generated through the chain, credits earned by serving and spent as priority.
 - **The Living Network** — the network *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself → rejoined by itself when the machine calmed); and credits are **weighted by layer share**. Your device, your priority, always.
 - **It Works** — the pipeline is now **resident**, so the model is not reloaded per question: time-to-first-token dropped from **5.17s to 0.07s (75x)** in the captured run. Tokens **stream** as they are generated, there's a **chat page** at the coordinator's address that anyone can use in a browser, and it all runs over a **real LAN address**, not loopback.
 - **Usable Together** — joining takes **one command and no address** (`--discover` finds the coordinator by broadcast); the network **holds a conversation** (full history through the model's own chat template); credits are **written to an append-only ledger** that survived the coordinator being killed mid-flight (verified by replaying the file with the coordinator dead); and several people are **served at once** (3x the throughput of one-at-a-time).
 
-Still day one: single-machine, trusted nodes, small models — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
+- **Two Networks** — each node now runs in its own Linux container on its own network, unable to even resolve the other; only the coordinator bridges them. A 1.5B model shards across the two (layers 0–17 / 18–28) and answers correctly. And the honest number: adding 40 ms of latency per link drops throughput from **31.3 to 4.2 tok/s (7.5x slower)** — splitting a model across a network means every token crosses every hop. Sanad is for models too big for one device, not for speed.
+
+Still early: trusted nodes, small models, one physical host (a [free-cloud guide](net/deploy/README.md) covers crossing real ISPs) — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
 **[sanad site →](https://a-alwabel.github.io/sanad/)** · اقرأ الملخص بالعربية: [README.ar.md](README.ar.md)
 

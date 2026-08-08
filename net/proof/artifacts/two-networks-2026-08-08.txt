@@ -1,0 +1,36 @@
+==========================================================================
+  0. Bring up 1 coordinator + 2 nodes, each node on its own network
+==========================================================================
+   node-a (operator amina) advertises node-a:50070
+   node-b (operator bilal) advertises node-b:50070
+==========================================================================
+  A. The two nodes are on DIFFERENT networks and cannot see each other
+==========================================================================
+   node-a lives at 172.28.0.3
+   node-b lives at 172.29.0.3
+   node-a trying to reach node-b directly -> socket.gaierror: [Errno -2] Name or service not known
+   -> only the coordinator bridges them. This is Sanad's topology, for real.
+==========================================================================
+  B. Real sharded inference across the two networks
+==========================================================================
+   RPC0  node-a:50070  layers 0-17  (18 layers)
+   RPC1  node-b:50070  layers 18-28  (11 layers)
+   text: A mining pool is a type of decentralized cryptocurrency mining service. It allows multiple miners to pool their resources together
+==========================================================================
+  C. WAN latency, measured (not assumed)
+==========================================================================
+   local-network baseline: 31.3 tok/s
+   injected 40 ms each-way (80 ms round trip) on both links via tc netem
+   under WAN latency:      4.2 tok/s (first token 4.26s)
+   -> 7.5x slower. This is the honest cost of splitting a model
+      across the internet: every token crosses every hop. Sanad is for
+      models too big for one device, NOT for speed. The docs say so.
+   latency removed.
+==========================================================================
+  D. Credits flowed to both operators, weighted by layers held
+==========================================================================
+   {'amina': 109.86299999999999, 'bilal': 67.137}
+==========================================================================
+  TWO NETWORKS: PASS - real sharding across isolated networks, WAN cost measured honestly
+==========================================================================
+(bringing the stack down)

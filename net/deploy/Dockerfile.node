@@ -1,0 +1,28 @@
+# A Sanad node in a container: llama.cpp's ggml-rpc-server wrapped by sanad_net.
+#
+# This exists to prove Sanad across a real network without buying a second
+# machine. Two of these containers on two separate Docker bridge networks each
+# get their own IP and their own network namespace, so they talk to the
+# coordinator over routed TCP — not shared memory, not loopback.
+FROM python:3.12-slim
+
+# llama.cpp Linux build (b10326: past the CVE-2026-34159 fix at b8492).
+ARG LLAMA_BUILD=b10326
+# curl to fetch llama.cpp; libgomp1 is the OpenMP runtime its binaries link against;
+# iproute2 provides `tc` for the optional WAN-latency emulation.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates libgomp1 iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sL -o /tmp/llama.tar.gz \
+      "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/llama-${LLAMA_BUILD}-bin-ubuntu-x64.tar.gz" \
+    && mkdir -p /opt/llama \
+    && tar xzf /tmp/llama.tar.gz -C /opt/llama --strip-components=1 \
+    && rm /tmp/llama.tar.gz
+# The binaries link against the bundled .so files next to them.
+ENV LD_LIBRARY_PATH=/opt/llama
+
+COPY sanad_net /app/sanad_net
+WORKDIR /app
+
+# Each service in compose supplies its own full command (coordinator or node),
+# so there is no baked-in entrypoint to fight with.

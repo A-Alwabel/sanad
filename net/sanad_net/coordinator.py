@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .discovery import DiscoveryResponder
 from .engine import EngineError, EngineManager
 from .ledger import Ledger
 
@@ -45,6 +46,8 @@ POOL_SAFETY_FACTOR = 1.4    # model needs file_size * factor of pooled memory (K
 MAX_TOKENS_CAP = 512        # per-request generation cap
 MAX_PLEDGE_MB = 1_000_000   # 1 TB — sanity bound; also rejects Infinity/NaN from JSON
 MAX_BODY_BYTES = 1_048_576  # 1 MB request-body cap
+MAX_MESSAGES = 40           # conversation turns kept per request
+MAX_MESSAGE_CHARS = 8000    # per-message ceiling
 WEBUI = Path(__file__).parent / "webui.html"
 
 
@@ -138,21 +141,24 @@ class Coordinator:
     RETRY_DELAY_S = 4.0        # > heartbeat period, so live nodes re-appear before a retry
     FIFO_EVERY = 3             # every Nth slot is strictly first-come-first-served
 
-    def __init__(self, engines: EngineManager, catalog: list[ModelTier]) -> None:
+    def __init__(self, engines: EngineManager, catalog: list[ModelTier],
+                 ledger: Ledger | None = None, concurrency: int = 4) -> None:
         self.registry = Registry()
-        self.ledger = Ledger()
+        self.ledger = ledger if ledger is not None else Ledger()
         self.engines = engines
         self.catalog = catalog
+        self.concurrency = max(1, concurrency)
         self.jobs_done = 0
         self.events: deque[dict] = deque(maxlen=1000)
         self._last_tier: str | None = None
         self._tier_lock = threading.Lock()
         self._pending: list[dict] = []
         self._cv = threading.Condition()
+        self._slots = threading.Semaphore(self.concurrency)
         self._served = 0
         self._seq = 0
         engines.on_event = self._event
-        threading.Thread(target=self._worker_loop, daemon=True).start()
+        threading.Thread(target=self._dispatch_loop, daemon=True).start()
 
     # -- capacity ladder -----------------------------------------------------
     def _compute_tier(self) -> tuple[ModelTier | None, list[dict], float]:
@@ -181,9 +187,12 @@ class Coordinator:
 
     # -- job scheduling ------------------------------------------------------
     def submit(self, user: str, prompt: str, max_tokens: int,
-               timeout_s: float = 900.0, stream_q: "queue.Queue | None" = None) -> dict:
+               timeout_s: float = 900.0, stream_q: "queue.Queue | None" = None,
+               messages: list[dict] | None = None) -> dict:
         """Blocking: enqueue with credit priority (escrowed), wait for the result.
 
+        `messages` carries a full conversation (OpenAI-style role/content list)
+        so the model can follow a thread; `prompt` alone is the single-turn form.
         If `stream_q` is given, token chunks are pushed onto it as ("token", text)
         while the job runs; the caller must drain it concurrently.
         """
@@ -194,6 +203,7 @@ class Coordinator:
         escrow = self.ledger.spend(user, float(max_tokens), f"escrow for job #{seq}")
         job = {
             "seq": seq, "priority": priority, "user": user, "prompt": prompt,
+            "messages": messages or [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "escrow": escrow, "stream_q": stream_q,
             "done": threading.Event(), "slot": {}, "cancelled": False, "started": False,
         }
@@ -223,31 +233,40 @@ class Coordinator:
         self._pending.remove(job)
         return job
 
-    def _worker_loop(self) -> None:
+    def _dispatch_loop(self) -> None:
+        """Admit jobs up to `concurrency`; each admitted job runs in its own
+        thread so several people are served at once (the engine interleaves
+        them across its slots with continuous batching)."""
         while True:
+            self._slots.acquire()
             with self._cv:
                 while not self._pending:
                     self._cv.wait()
                 job = self._pop_next_locked()
-                if job["cancelled"]:
-                    self._event(f"job #{job['seq']} cancelled before start - skipped (escrow refunded)")
-                    job["done"].set()
-                    continue
-                job["started"] = True
-            try:
-                job["slot"]["result"] = self._run_job_with_repair(job)
-                if job["stream_q"] is not None:
-                    job["stream_q"].put(("done", job["slot"]["result"]))
-            except Exception as exc:
-                msg = f"{type(exc).__name__}: {exc}"
-                job["slot"]["error"] = msg
-                if job["escrow"] > 0:
-                    self.ledger.earn(job["user"], job["escrow"],
-                                     f"escrow refund (job #{job['seq']} failed)")
-                if job["stream_q"] is not None:
-                    job["stream_q"].put(("error", msg))
-            finally:
+            if job["cancelled"]:
+                self._event(f"job #{job['seq']} cancelled before start - skipped (escrow refunded)")
                 job["done"].set()
+                self._slots.release()
+                continue
+            job["started"] = True
+            threading.Thread(target=self._execute, args=(job,), daemon=True).start()
+
+    def _execute(self, job: dict) -> None:
+        try:
+            job["slot"]["result"] = self._run_job_with_repair(job)
+            if job["stream_q"] is not None:
+                job["stream_q"].put(("done", job["slot"]["result"]))
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            job["slot"]["error"] = msg
+            if job["escrow"] > 0:
+                self.ledger.earn(job["user"], job["escrow"],
+                                 f"escrow refund (job #{job['seq']} failed)")
+            if job["stream_q"] is not None:
+                job["stream_q"].put(("error", msg))
+        finally:
+            job["done"].set()
+            self._slots.release()
 
     def _run_job_with_repair(self, job: dict) -> dict:
         """On pipeline failure, evict nodes with no heartbeat since the job
@@ -278,7 +297,7 @@ class Coordinator:
             on_token = None
             if job["stream_q"] is not None:
                 on_token = lambda t: job["stream_q"].put(("token", t))  # noqa: E731
-            result = engine.complete(job["prompt"], job["max_tokens"], on_token=on_token)
+            result = engine.chat(job["messages"], job["max_tokens"], on_token=on_token)
         except EngineError as exc:
             failure = ChainFailure(str(exc))
             failure.node_ids = [n["node_id"] for n in nodes]
@@ -385,6 +404,8 @@ def make_handler(coord: Coordinator):
                 self.wfile.write(body)
             elif self.path == "/status":
                 self._json(200, coord.status())
+            elif self.path == "/ledger/audit":
+                self._json(200, coord.ledger.audit())
             elif self.path.startswith("/ledger"):
                 self._json(200, {"entries": [
                     {"ts": round(e.ts, 2), "account": e.account, "delta": e.delta, "reason": e.reason}
@@ -393,15 +414,34 @@ def make_handler(coord: Coordinator):
             else:
                 self._json(404, {"error": "unknown path"})
 
-        def _parse_ask(self, data: dict) -> tuple[str, str, int]:
+        def _parse_ask(self, data: dict) -> tuple[str, str, int, list[dict]]:
             raw = data.get("max_tokens", 48)
             if isinstance(raw, float) and not math.isfinite(raw):
                 raise ValueError("max_tokens must be finite")
-            return (str(data.get("user", "anon")), str(data["prompt"]),
-                    max(1, min(int(raw), MAX_TOKENS_CAP)))
+            max_tokens = max(1, min(int(raw), MAX_TOKENS_CAP))
+            user = str(data.get("user", "anon"))
+
+            messages = data.get("messages")
+            if messages is not None:
+                if not isinstance(messages, list) or not messages:
+                    raise ValueError("messages must be a non-empty list")
+                if len(messages) > MAX_MESSAGES:
+                    messages = messages[-MAX_MESSAGES:]      # keep the recent turns
+                clean = []
+                for m in messages:
+                    role = str(m.get("role", "user"))
+                    if role not in ("system", "user", "assistant"):
+                        raise ValueError(f"unknown message role: {role}")
+                    content = str(m.get("content", ""))[:MAX_MESSAGE_CHARS]
+                    clean.append({"role": role, "content": content})
+                prompt = clean[-1]["content"]
+                return user, prompt, max_tokens, clean
+
+            prompt = str(data["prompt"])[:MAX_MESSAGE_CHARS]
+            return user, prompt, max_tokens, [{"role": "user", "content": prompt}]
 
         def _stream_ask(self, data: dict) -> None:
-            user, prompt, max_tokens = self._parse_ask(data)
+            user, prompt, max_tokens, messages = self._parse_ask(data)
             q: queue.Queue = queue.Queue()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -411,7 +451,7 @@ def make_handler(coord: Coordinator):
 
             def run():
                 try:
-                    coord.submit(user, prompt, max_tokens, stream_q=q)
+                    coord.submit(user, prompt, max_tokens, stream_q=q, messages=messages)
                 except Exception as exc:
                     q.put(("error", f"{type(exc).__name__}: {exc}"))
 
@@ -453,8 +493,8 @@ def make_handler(coord: Coordinator):
                     coord.current_tier()  # re-evaluate the ladder on leave
                     self._json(200, {"ok": ok})
                 elif self.path == "/ask":
-                    user, prompt, max_tokens = self._parse_ask(data)
-                    self._json(200, coord.submit(user, prompt, max_tokens))
+                    user, prompt, max_tokens, messages = self._parse_ask(data)
+                    self._json(200, coord.submit(user, prompt, max_tokens, messages=messages))
                 elif self.path == "/ask/stream":
                     self._stream_ask(data)
                 else:
@@ -478,25 +518,47 @@ def main() -> None:
                     help="comma-separated GGUF paths, the capacity-ladder catalog")
     ap.add_argument("--llama-bin", required=True, help="directory containing llama-server")
     ap.add_argument("--engine-port", type=int, default=7970)
+    ap.add_argument("--ledger", default=None,
+                    help="path to an append-only ledger file; credits survive restarts "
+                         "(default: in-memory only)")
+    ap.add_argument("--concurrency", type=int, default=4,
+                    help="how many requests to serve at once (engine slots)")
+    ap.add_argument("--name", default="sanad", help="network name announced on the LAN")
+    ap.add_argument("--no-discovery", action="store_true",
+                    help="do not answer LAN discovery broadcasts")
     args = ap.parse_args()
 
     catalog = load_catalog(args.models.split(","))
-    engines = EngineManager(Path(args.llama_bin).resolve(), port=args.engine_port)
-    coord = Coordinator(engines, catalog)
+    engines = EngineManager(Path(args.llama_bin).resolve(), port=args.engine_port,
+                            slots=args.concurrency)
+    ledger = Ledger(path=Path(args.ledger)) if args.ledger else Ledger()
+    coord = Coordinator(engines, catalog, ledger=ledger, concurrency=args.concurrency)
     if args.bind != "127.0.0.1":
         print("[sanad-coordinator] NOTE: binding beyond loopback. v0 has no "
               "authentication and llama.cpp's RPC backend is not hardened — "
               "trusted networks only.")
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(coord))
+    responder = None
+    if not args.no_discovery:
+        responder = DiscoveryResponder(args.port, name=args.name)
+        responder.start()
     tiers = " -> ".join(f"{t.name} (needs {t.need_mb:.0f} MB)" for t in catalog)
     print(f"[sanad-coordinator] http://{args.bind}:{args.port}  (open it in a browser to chat)")
     print(f"[sanad-coordinator] ladder: {tiers}")
+    print(f"[sanad-coordinator] serving up to {args.concurrency} requests at once"
+          + (f"; ledger: {args.ledger}" if args.ledger else "; ledger: in-memory (use --ledger to persist)"))
+    if responder is not None:
+        print(f"[sanad-coordinator] nodes on this network can join with: "
+              f"python -m sanad_net.node --discover ...")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if responder is not None:
+            responder.stop()
         engines.stop()
+        ledger.close()
 
 
 if __name__ == "__main__":

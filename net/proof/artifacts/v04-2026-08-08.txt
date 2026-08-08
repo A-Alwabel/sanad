@@ -1,0 +1,39 @@
+
+==========================================================================
+  0. Real network on 192.168.0.188 (not loopback); ledger at C:\Users\User\AppData\Local\Temp\sanad-proof-0iaq51hy\ledger.jsonl
+==========================================================================
+
+==========================================================================
+  A. ONE-COMMAND JOIN - the node is given no address at all
+==========================================================================
+[sanad-node] looking for a coordinator on this network...
+[sanad-node] found 'sanad-proof' at http://192.168.0.188:7866
+[riyadh-a] SERVING on 192.168.0.188:50140 (pledge 1000 MB, low OS priority, operator amina)
+node joined by broadcast: advertises 192.168.0.188:50140, operator amina
+
+==========================================================================
+  B. IT REMEMBERS - turn 2 answers what only turn 1 established
+==========================================================================
+turn 1 -> Hello Abdullah! It's a pleasure to meet you. My name is Qwen, and I am created by Alibaba Cloud. How can I assist you to
+turn 2 -> Your name is Abdullah and your project is called Sanad.
+-> both facts recalled: the conversation is real, not a series of strangers
+
+==========================================================================
+  D. MANY AT ONCE - four people served concurrently
+==========================================================================
+individual durations: [2.61, 1.22, 2.61, 1.35]
+wall clock for all four: 2.62s   (sum if served one-by-one: 7.80s)
+-> 3.0x more throughput than serving them one at a time
+
+==========================================================================
+  C. CREDITS SURVIVE - kill the coordinator, bring it back
+==========================================================================
+balances before: {'amina': 162.0}
+coordinator killed.
+replayed from the file alone: {'amina': 162.0}  (entries: 6, self-consistent: True)
+balances after restart: {'amina': 162.0}
+-> every credit came back. Contribution is not erased by an outage.
+
+==========================================================================
+  V0.4: PASS - one-command join, memory, durable credits, concurrency
+==========================================================================

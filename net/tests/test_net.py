@@ -69,8 +69,9 @@ class FakeEngine:
     def alive(self):
         return True
 
-    def complete(self, prompt, max_tokens, on_token=None):
-        self.mgr.calls.append(prompt)
+    def chat(self, messages, max_tokens, on_token=None, temperature=0.7):
+        self.mgr.calls.append(messages[-1]["content"])
+        self.mgr.message_lists.append(list(messages))
         if self.mgr.fail_times > 0:
             self.mgr.fail_times -= 1
             raise EngineError("simulated pipeline failure (node vanished mid-job)")
@@ -82,8 +83,11 @@ class FakeEngine:
                 on_token(piece)
         if self.mgr.unprovable:
             self.shard_map = {}
-        return {"text": f"echo:{prompt}", "decode_tokens": 25, "tok_per_s": 60.0,
-                "wall_s": self.mgr.delay_s, "ttft_s": 0.01}
+        return {"text": f"echo:{messages[-1]['content']}", "decode_tokens": 25,
+                "tok_per_s": 60.0, "wall_s": self.mgr.delay_s, "ttft_s": 0.01}
+
+    def complete(self, prompt, max_tokens, on_token=None):
+        return self.chat([{"role": "user", "content": prompt}], max_tokens, on_token)
 
     def stop(self):
         pass
@@ -98,6 +102,7 @@ class FakeEngines:
         self.gate = gate
         self.unprovable = unprovable
         self.calls: list[str] = []
+        self.message_lists: list[list] = []
         self.engine = None
         self.signature = None
         self.restarts = 0
@@ -126,9 +131,9 @@ class FakeEngines:
         self.engine = None
 
 
-def mk_coord(engines=None, nodes=True) -> tuple[Coordinator, FakeEngines]:
+def mk_coord(engines=None, nodes=True, concurrency=4) -> tuple[Coordinator, FakeEngines]:
     engines = engines or FakeEngines()
-    coord = Coordinator(engines, CATALOG)
+    coord = Coordinator(engines, CATALOG, concurrency=concurrency)
     coord.RETRY_DELAY_S = 0.05  # fast retries in tests
     if nodes:
         coord.registry.register("n1", "127.0.0.1", 50060, "amina", 1000)
@@ -303,8 +308,10 @@ class TestCoordinatorScheduling(unittest.TestCase):
         self.assertTrue(any("escrow refund" in r for r in reasons))
 
     def test_priority_orders_queue_deterministically(self):
+        # Priority only binds under contention, so this is a single-slot server:
+        # with free slots every job is admitted at once and order is moot.
         gate = threading.Event()
-        coord, engines = mk_coord(FakeEngines(gate=gate))
+        coord, engines = mk_coord(FakeEngines(gate=gate), concurrency=1)
         coord.ledger.earn("vip", 100, "operated a node")
         threads = [threading.Thread(target=coord.submit, args=("anon", "filler", 10))]
         threads[0].start()
@@ -322,7 +329,7 @@ class TestCoordinatorScheduling(unittest.TestCase):
 
     def test_anti_starvation_fifo_slot(self):
         gate = threading.Event()
-        coord, engines = mk_coord(FakeEngines(gate=gate))
+        coord, engines = mk_coord(FakeEngines(gate=gate), concurrency=1)
         for v in ("v1", "v2", "v3", "v4"):
             coord.ledger.earn(v, 1000, "operator")
         threads = [threading.Thread(target=coord.submit, args=("anon", "filler", 5))]
@@ -342,7 +349,7 @@ class TestCoordinatorScheduling(unittest.TestCase):
 
     def test_timed_out_job_is_cancelled_refunded_and_never_runs(self):
         gate = threading.Event()
-        coord, engines = mk_coord(FakeEngines(gate=gate))
+        coord, engines = mk_coord(FakeEngines(gate=gate), concurrency=1)
         coord.ledger.earn("maha", 100, "operator")
         t1 = threading.Thread(target=lambda: coord.submit("anon", "filler", 5))
         t1.start()
@@ -373,7 +380,7 @@ class TestCoordinatorScheduling(unittest.TestCase):
 
     def test_chain_repair_evicts_stale_and_retries_with_survivor(self):
         gate = threading.Event()
-        coord, engines = mk_coord(FakeEngines(gate=gate, fail_times=1))
+        coord, engines = mk_coord(FakeEngines(gate=gate, fail_times=1), concurrency=1)
         for nid in ("n1", "n2"):     # registration precedes the job on a coarse clock
             coord.registry._nodes[nid]["last_seen"] -= 1.0
         box: dict = {}
@@ -397,6 +404,116 @@ class TestCoordinatorScheduling(unittest.TestCase):
         self.assertAlmostEqual(coord.ledger.balance("maha"), 100.0, places=2)  # refunded
         self.assertEqual(coord.ledger.balance("amina"), 0.0)                    # nothing minted
         self.assertTrue(any("unprovable" in e["event"] for e in coord.events))
+
+
+class TestConversation(unittest.TestCase):
+    def test_whole_conversation_reaches_the_engine(self):
+        coord, engines = mk_coord()
+        convo = [
+            {"role": "user", "content": "my name is Abdullah"},
+            {"role": "assistant", "content": "hello Abdullah"},
+            {"role": "user", "content": "what is my name?"},
+        ]
+        coord.submit("anon", "what is my name?", 25, messages=convo)
+        sent = engines.message_lists[-1]
+        self.assertEqual(len(sent), 3)                      # history, not just the last turn
+        self.assertEqual(sent[0]["content"], "my name is Abdullah")
+        self.assertEqual(sent[-1]["role"], "user")
+
+    def test_single_prompt_becomes_one_user_message(self):
+        coord, engines = mk_coord()
+        coord.submit("anon", "hello", 25)
+        self.assertEqual(engines.message_lists[-1], [{"role": "user", "content": "hello"}])
+
+
+class TestLedgerDurability(unittest.TestCase):
+    def test_credits_survive_a_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ledger.jsonl"
+            first = Ledger(path=path)
+            first.earn("amina", 12.5, "served layers")
+            first.spend("amina", 4.0, "inference")
+            self.assertAlmostEqual(first.balance("amina"), 8.5, places=6)
+            first.close()
+
+            revived = Ledger(path=path)                      # coordinator restarts
+            self.assertAlmostEqual(revived.balance("amina"), 8.5, places=6)
+            self.assertEqual(len(revived.entries()), 2)
+            self.assertTrue(revived.audit()["consistent"])
+            revived.close()
+
+    def test_corrupt_trailing_line_is_skipped_not_fatal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ledger.jsonl"
+            led = Ledger(path=path)
+            led.earn("amina", 5.0, "served")
+            led.close()
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write('{"ts": 1, "account": "amina", "delta": ')   # crash mid-write
+            revived = Ledger(path=path)
+            self.assertAlmostEqual(revived.balance("amina"), 5.0, places=6)
+            revived.close()
+
+    def test_audit_detects_tampering(self):
+        led = Ledger()
+        led.earn("amina", 10.0, "served")
+        self.assertTrue(led.audit()["consistent"])
+        led._balances["amina"] = 999.0                        # simulate a corrupted cache
+        audit = led.audit()
+        self.assertFalse(audit["consistent"])
+        self.assertIn("amina", audit["mismatches"])
+
+
+class TestConcurrency(unittest.TestCase):
+    def test_jobs_run_in_parallel_up_to_the_slot_count(self):
+        gate = threading.Event()
+        coord, engines = mk_coord(FakeEngines(gate=gate), concurrency=3)
+        threads = [threading.Thread(target=coord.submit, args=("u%d" % i, "q%d" % i, 5))
+                   for i in range(3)]
+        for t in threads:
+            t.start()
+        deadline = time.time() + 5
+        while len(engines.calls) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(engines.calls), 3, "all three should be in flight at once")
+        gate.set()
+        for t in threads:
+            t.join(timeout=10)
+
+    def test_concurrency_is_bounded(self):
+        gate = threading.Event()
+        coord, engines = mk_coord(FakeEngines(gate=gate), concurrency=2)
+        threads = [threading.Thread(target=coord.submit, args=("u%d" % i, "q%d" % i, 5))
+                   for i in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.4)
+        self.assertEqual(len(engines.calls), 2, "the 3rd and 4th must wait for a slot")
+        gate.set()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(len(engines.calls), 4)
+
+
+class TestDiscovery(unittest.TestCase):
+    def test_responder_answers_a_broadcast(self):
+        from sanad_net.discovery import DiscoveryResponder, discover
+        responder = DiscoveryResponder(http_port=7899, name="test-net")
+        responder.start()
+        if responder._sock is None:
+            self.skipTest("discovery port unavailable in this environment")
+        try:
+            found = discover(timeout_s=2.0)
+            self.assertTrue(found, "no coordinator answered the broadcast")
+            # Other coordinators may share this LAN; find ours among the replies.
+            ours = [f for f in found if f["name"] == "test-net"]
+            self.assertTrue(ours, f"our responder did not answer; got {found}")
+            self.assertTrue(ours[0]["coordinator"].startswith("http://"))
+            self.assertTrue(ours[0]["coordinator"].endswith(":7899"))
+        finally:
+            responder.stop()
 
 
 class TestHTTPSurface(unittest.TestCase):

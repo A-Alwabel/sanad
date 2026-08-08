@@ -7,6 +7,7 @@ Three milestones, all fully reproducible:
 | **Part 1 — First Light** (v0.1) | Real sharded inference + live credit economy | [first-light transcript](../net/proof/artifacts/first-light-2026-08-05.txt) | [run_first_light.py](../net/proof/run_first_light.py) |
 | **Part 2 — The Living Network** (v0.2) | Capacity ladder + polite node + weighted fairness | [living-network transcript](../net/proof/artifacts/living-network-2026-08-05.txt) | [run_living_network.py](../net/proof/run_living_network.py) |
 | **Part 3 — It Works** (v0.3) | Resident pipeline, live streaming, chat UI, real LAN | [it-works transcript](../net/proof/artifacts/it-works-2026-08-08.txt) | [run_it_works.py](../net/proof/run_it_works.py) |
+| **Part 4 — Usable Together** (v0.4) | One-command join, conversation memory, durable credits, concurrency | [v0.4 transcript](../net/proof/artifacts/v04-2026-08-08.txt) | [run_v04.py](../net/proof/run_v04.py) |
 
 ---
 
@@ -254,7 +255,91 @@ share (amina 1000 MB pledge earned more than bilal's 700 MB).
 - The engine is coordinator-local by design in v0 (`llama-server` binds
   loopback); nodes are the distributed part.
 
+---
+
+# Part 4 — Usable Together (v0.4)
+
+**Date:** 2026-08-08 · **Status:** PASS · **Raw transcript:** [net/proof/artifacts/v04-2026-08-08.txt](../net/proof/artifacts/v04-2026-08-08.txt) · **Reproduce:** [net/proof/run_v04.py](../net/proof/run_v04.py)
+
+Part 3 made the network fast. This one makes it something a group of people can
+actually share: joinable in one command, able to hold a conversation, able to
+serve several people at once, and unable to lose anyone's contribution.
+
+## A. Joining takes one command and no address
+
+The node in this proof is started with **no `--coordinator`, no IP, no port** —
+only `--discover`. It broadcasts on the local network, the coordinator answers
+with an address reachable from the asker's side, and the node registers:
+
+```
+[sanad-node] looking for a coordinator on this network...
+[sanad-node] found 'sanad-proof' at http://192.168.0.188:7866
+[riyadh-a] SERVING on 192.168.0.188:50140 (pledge 1000 MB, low OS priority, operator amina)
+```
+
+Discovery is broadcast-only, so it never leaves the subnet, and it is a
+convenience rather than a trust mechanism: anyone on your LAN could answer, so
+pass an explicit `--coordinator` on networks you do not trust.
+
+## B. It holds a conversation
+
+Requests now carry the whole thread, and llama-server applies the model's own
+chat template (`--jinja`). Both matter: the template is what makes an instruct
+model answer rather than ramble a raw continuation, and the history is what
+makes turn 2 possible.
+
+```
+turn 1 -> "Hello Abdullah! It's a pleasure to meet you..."
+turn 2 -> "Your name is Abdullah and your project is called Sanad."
+```
+
+The proof asserts both facts are recalled — established only in turn 1, needed
+only in turn 2.
+
+## C. Credits survive an outage
+
+The ledger is now append-only on disk, fsynced per entry. The proof kills the
+coordinator mid-flight and checks the balances three ways:
+
+```
+balances before:                 {'amina': 162.0}
+replayed from the file alone:    {'amina': 162.0}   (6 entries, self-consistent)
+balances after restart:          {'amina': 162.0}
+```
+
+The middle line is the important one: the file was replayed by a *separate
+process, with the coordinator dead*. That is what makes "append-only and
+auditable" a fact rather than a claim — and it is what GOVERNANCE.md's promise
+that contribution is never erased actually requires. `GET /ledger/audit`
+recomputes every balance from the entries on demand.
+
+## D. Several people at once
+
+The engine runs with parallel slots and continuous batching, and the
+coordinator admits up to `--concurrency` jobs at a time:
+
+```
+individual durations: [2.61, 1.22, 2.61, 1.35]
+wall clock for all four: 2.62s   (sum if served one-by-one: 7.80s)
+-> 3.0x more throughput
+```
+
+A note the tests now encode: **priority only binds under contention.** With
+free slots, everyone is admitted immediately and credit order is moot; the
+queue tests therefore run against a deliberately single-slot server.
+
+## What Part 4 still does not prove
+
+- **Still one physical machine.** Every proof so far runs processes on one box
+  over the real LAN interface. Two machines remains the next milestone.
+- **Still centrally coordinated.** The compute is distributed; the control
+  plane is not. One coordinator holds the registry, ledger, and queue — this is
+  the AI Horde model, stated plainly, not the blockchain one. Federation
+  (several coordinators recognizing each other) is the intended path to
+  decentralising control without a token; it is not built.
+- Trust, privacy, and scale caveats from Part 1 are unchanged.
+
 ## Next milestone
 
 Two nodes on **two different machines on two different networks**, same proofs
-— then the audit hooks from the roadmap.
+— then federation, then the audit hooks from the roadmap.

@@ -377,9 +377,29 @@ def main() -> None:
                     help="drain out when other-process CPU%% stays above this (101 = dedicated)")
     ap.add_argument("--resume-at", type=float, default=25,
                     help="rejoin when other-process CPU%% stays below this")
-    ap.add_argument("--coordinator", default="http://127.0.0.1:7860")
+    ap.add_argument("--coordinator", default=None,
+                    help="coordinator URL; omit with --discover to find one on your LAN")
+    ap.add_argument("--discover", action="store_true",
+                    help="find the coordinator by asking the local network")
     ap.add_argument("--rpc-bin", required=True, help="directory containing ggml-rpc-server")
-    PoliteNode(ap.parse_args()).run()
+    args = ap.parse_args()
+
+    if args.discover or not args.coordinator:
+        from .discovery import discover
+        print("[sanad-node] looking for a coordinator on this network...", flush=True)
+        found = discover()
+        if not found:
+            sys.exit("no coordinator answered on this network. Start one, or pass "
+                     "--coordinator http://<its-address>:7860")
+        if len(found) > 1:
+            print("[sanad-node] several coordinators answered; using the first:")
+            for f in found:
+                print(f"    {f['name']}  {f['coordinator']}")
+        args.coordinator = found[0]["coordinator"]
+        print(f"[sanad-node] found '{found[0]['name']}' at {args.coordinator}")
+        if args.host == "127.0.0.1" and not found[0]["from"].startswith("127."):
+            args.host = "0.0.0.0"    # the coordinator is remote: listen for it
+    PoliteNode(args).run()
 
 
 if __name__ == "__main__":

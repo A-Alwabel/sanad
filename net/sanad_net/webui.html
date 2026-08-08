@@ -72,7 +72,11 @@
     padding:12px 10px;font-family:var(--mono);font-size:13px;width:112px;
   }
   .who-input:focus{outline:2px solid var(--jade);outline-offset:-1px}
-  .hint{max-width:820px;margin:9px auto 0;font-family:var(--mono);font-size:11px;color:#5e627e}
+  .hint{max-width:820px;margin:9px auto 0;font-family:var(--mono);font-size:11px;color:#5e627e;
+        display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}
+  .linkbtn{background:none;border:0;color:var(--jade);font-family:var(--mono);font-size:11px;
+           padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+  .linkbtn:hover{color:var(--gold)}
   @media(max-width:560px){ .who{width:44px} .who-input{width:88px} }
 </style>
 </head>
@@ -108,7 +112,10 @@
     <textarea id="prompt" rows="1" placeholder="Ask anything…  (Enter to send, Shift+Enter for a new line)" aria-label="Your message"></textarea>
     <button id="send">Send</button>
   </div>
-  <div class="hint">Type a name to earn and spend credits under it — anonymous works too, just at lower priority.</div>
+  <div class="hint">
+    Type a name to earn and spend credits under it — anonymous works too, just at lower priority.
+    <button id="newchat" class="linkbtn">New conversation</button>
+  </div>
 </footer>
 
 <script>
@@ -120,6 +127,9 @@
   var sendBtn = document.getElementById('send');
   var empty = document.getElementById('empty');
   var busy = false;
+  // The whole conversation travels with each request, so the model can follow
+  // the thread instead of answering every message as if it were the first.
+  var history = [];
 
   function esc(s){ return (s||'').replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
   function scroll(){ main.scrollTop = main.scrollHeight; }
@@ -178,6 +188,7 @@
     if(!text || busy) return;
     busy = true; sendBtn.disabled = true;
     promptEl.value = '';
+    promptEl.style.height = 'auto';
     addMsg('you', 'me').textContent = text;
     var out = addMsg('sanad', 'net');
     var body = document.createElement('span');
@@ -185,9 +196,10 @@
     cur.className = 'cursor';
     out.appendChild(body); out.appendChild(cur);
 
+    history.push({role:'user', content:text});
     fetch('/ask/stream', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({user:userEl.value||'anon', prompt:text, max_tokens:160})
+      body: JSON.stringify({user:userEl.value||'anon', messages:history, max_tokens:320})
     }).then(function(resp){
       var reader = resp.body.getReader();
       var dec = new TextDecoder();
@@ -204,9 +216,14 @@
             var ev;
             try { ev = JSON.parse(line.slice(5).trim()); } catch(e){ return; }
             if(ev.type === 'token'){ body.textContent += ev.text; scroll(); }
-            else if(ev.type === 'done'){ cur.remove(); renderMeta(out, ev.result); refreshStatus(); }
+            else if(ev.type === 'done'){
+              cur.remove();
+              history.push({role:'assistant', content: ev.result.text || body.textContent});
+              renderMeta(out, ev.result); refreshStatus();
+            }
             else if(ev.type === 'error'){
               cur.remove();
+              history.pop();          // that turn never happened; don't poison the thread
               var e = document.createElement('div');
               e.className = 'meta err';
               e.textContent = ev.error;
@@ -227,6 +244,18 @@
       busy = false; sendBtn.disabled = false; promptEl.focus();
     });
   }
+
+  document.getElementById('newchat').addEventListener('click', function(){
+    if(busy) return;
+    history = [];
+    thread.innerHTML = '';
+    var e = document.createElement('div');
+    e.className = 'empty';
+    e.innerHTML = '<span class="big">New conversation.</span>The network has forgotten the previous thread; your credits are untouched.';
+    thread.appendChild(e);
+    empty = e;
+    promptEl.focus();
+  });
 
   sendBtn.addEventListener('click', send);
   promptEl.addEventListener('keydown', function(e){

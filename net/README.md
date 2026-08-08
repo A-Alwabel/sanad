@@ -1,19 +1,36 @@
-# sanad_net — the real network layer (v0.3, "it works")
+# sanad_net — the real network layer (v0.4, "usable together")
 
 This is Sanad running **for real**: a GGUF model's layers are physically split
 across separate node processes that communicate over TCP, with a Sanad
 coordinator assembling the chain, streaming the answer back, and accounting
 non-tradeable credits.
 
-Proven in three recorded milestones — First Light, the Living Network, and It
-Works — see [docs/PROOF.md](../docs/PROOF.md) and the captured transcripts in
-[proof/artifacts/](proof/artifacts/).
+Proven in four recorded milestones — First Light, the Living Network, It Works,
+and Usable Together — see [docs/PROOF.md](../docs/PROOF.md) and the captured
+transcripts in [proof/artifacts/](proof/artifacts/).
 
 **Use it in a browser:** start a coordinator and one node (below), then open the
 coordinator's address. You get a chat page that shows, under every answer, which
 nodes served which layers, how fast, and who earned the credits.
 
-## What v0.3 does
+## What v0.4 adds
+
+- **One-command join** — `--discover` finds the coordinator by LAN broadcast;
+  no address to type. Broadcast-only (never routed off the subnet) and a
+  convenience, not a trust mechanism: pass `--coordinator` explicitly on
+  networks you don't trust.
+- **Conversations** — `/ask` and `/ask/stream` accept a `messages` list
+  (OpenAI-style roles), and the engine applies the model's own chat template
+  (`--jinja`). Single `prompt` still works and becomes one user message.
+- **Durable credits** — `--ledger path.jsonl` makes the ledger append-only on
+  disk, fsynced per entry and replayed at startup, so contribution survives a
+  restart or crash. `GET /ledger/audit` recomputes every balance from the
+  entries; anyone with the file can repeat the check.
+- **Concurrency** — `--concurrency N` (default 4) serves N requests at once via
+  engine slots and continuous batching. Note that credit priority only binds
+  when slots are scarce; with free slots everyone is admitted immediately.
+
+## What v0.3 added
 
 - **Resident pipeline** — a `llama-server` holds the sharded model in the nodes'
   memory and stays alive. The first question builds the pipeline; every later
@@ -78,10 +95,15 @@ are implemented but have not had a recorded milestone run.
 
 ## Honest scope (read this)
 
-- Everything so far has run on **one physical machine**. v0.3's proof binds to
-  the machine's real LAN address and nodes advertise dialable addresses — the
-  last step before two houses — but two machines on two networks is still the
-  next milestone, not a claim.
+- Everything so far has run on **one physical machine**. The proofs bind to the
+  machine's real LAN address and nodes advertise dialable addresses — the last
+  step before two houses — but two machines on two networks is still the next
+  milestone, not a claim.
+- **The compute is distributed; the coordination is not.** One coordinator holds
+  the registry, ledger, and queue. This is the AI Horde model, not the
+  blockchain one — there is no consensus layer and no token. Federation (several
+  coordinators recognising each other) is the intended path to decentralising
+  control; it is not built.
 - llama.cpp's RPC backend is upstream-labeled **"fragile and insecure — never
   run the rpc-server on an open network"**. Trusted machines only, for now.
   This matches the permissioned-first trust model in
@@ -108,17 +130,18 @@ are implemented but have not had a recorded milestone run.
 cd net
 
 # terminal 1 — coordinator with a capacity-ladder catalog (small,large).
-# --bind 0.0.0.0 lets nodes and browsers on your network reach it.
+# --bind 0.0.0.0 lets nodes and browsers on your network reach it;
+# --ledger keeps everyone's credits across restarts.
 python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0 `
     --models ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf,../.local/models/qwen2.5-1.5b-instruct-q4_k_m.gguf `
-    --llama-bin ../.local/bin
+    --llama-bin ../.local/bin --ledger ../.local/ledger.jsonl
 
 # terminals 2 & 3 — nodes (in real life: two different people's machines).
-# Use each machine's own address for --coordinator.
-python -m sanad_net.node --node-id riyadh-a --operator amina --host 0.0.0.0 --port 50070 `
-    --pledge-mb 1000 --busy-at 101 --rpc-bin ../.local/bin --coordinator http://192.168.0.10:7860
-python -m sanad_net.node --node-id jeddah-b --operator bilal --host 0.0.0.0 --port 50071 `
-    --pledge-mb 700 --rpc-bin ../.local/bin --coordinator http://192.168.0.10:7860
+# --discover finds the coordinator on your network; no address needed.
+python -m sanad_net.node --node-id riyadh-a --operator amina --port 50070 `
+    --pledge-mb 1000 --busy-at 101 --discover --rpc-bin ../.local/bin
+python -m sanad_net.node --node-id jeddah-b --operator bilal --port 50071 `
+    --pledge-mb 700 --discover --rpc-bin ../.local/bin
 
 # then: open http://192.168.0.10:7860/ in a browser and start typing.
 # or from a terminal:
@@ -131,6 +154,7 @@ python -m sanad_net.client --coordinator http://192.168.0.10:7860 statement --us
 
 ```powershell
 cd net
+python proof/run_v04.py               # v0.4: one-command join, memory, durable credits, concurrency
 python proof/run_it_works.py          # v0.3: resident pipeline, streaming, chat UI, real LAN
 python proof/run_living_network.py    # v0.2: capacity ladder, polite node, weighted credits
 python proof/run_first_light.py       # v0.1: sharded inference + credit priority

@@ -73,13 +73,15 @@ class Engine:
     """One resident llama-server bound to one pipeline."""
 
     def __init__(self, bin_dir: Path, model_path: Path, rpc_servers: list[str],
-                 tensor_split: list[float], port: int, ctx_size: int = 4096) -> None:
+                 tensor_split: list[float], port: int, ctx_size: int = 4096,
+                 slots: int = 4) -> None:
         self.bin_dir = bin_dir
         self.model_path = model_path
         self.rpc_servers = list(rpc_servers)
         self.tensor_split = list(tensor_split)
         self.port = port
         self.ctx_size = ctx_size
+        self.slots = max(1, slots)
         self.base = f"http://127.0.0.1:{port}"
         self.proc: subprocess.Popen | None = None
         self.shard_map: dict = {}
@@ -99,7 +101,12 @@ class Engine:
             "--host", "127.0.0.1",          # engine is coordinator-local by design
             "--port", str(self.port),
             "-ngl", "99",
-            "-c", str(self.ctx_size),
+            # Context is shared across slots, so scale it with the slot count:
+            # each concurrent conversation needs its own room.
+            "-c", str(self.ctx_size * self.slots),
+            "-np", str(self.slots),          # concurrent conversations
+            "--cont-batching",               # interleave them instead of queueing
+            "--jinja",                       # apply the model's own chat template
             "--no-webui",                    # Sanad serves its own UI
             "-v",                            # exposes per-layer device assignment
         ]
@@ -165,53 +172,62 @@ class Engine:
         return self.proc is not None and self.proc.poll() is None
 
     # -- inference -----------------------------------------------------------
-    def complete(self, prompt: str, max_tokens: int, on_token=None) -> dict:
-        """Stream a completion. `on_token(text)` is called per chunk as it arrives.
+    def chat(self, messages: list[dict], max_tokens: int, on_token=None,
+             temperature: float = 0.7) -> dict:
+        """Stream a chat completion through the model's own chat template.
 
+        `messages` is an OpenAI-style list of {"role", "content"} — the whole
+        conversation, so the model can actually follow a thread. llama-server
+        applies the model's template (--jinja), which is what makes an instruct
+        model answer like one instead of rambling a raw continuation.
+
+        `on_token(text)` is called per chunk as it arrives.
         Returns {"text", "decode_tokens", "tok_per_s", "wall_s", "ttft_s"}.
         """
         if not self.alive():
             raise EngineError("engine is not running")
         payload = json.dumps({
-            "prompt": prompt,
-            "n_predict": max_tokens,
-            "temperature": 0,
-            "seed": 42,
-            "cache_prompt": True,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
             "stream": True,
         }).encode()
         req = urllib.request.Request(
-            f"{self.base}/completion", data=payload,
+            f"{self.base}/v1/chat/completions", data=payload,
             headers={"Content-Type": "application/json"}, method="POST",
         )
         t0 = time.time()
         ttft = 0.0
         pieces: list[str] = []
         timings: dict = {}
-        tokens_predicted = 0
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 for raw in resp:
                     line = raw.decode("utf-8", "replace").strip()
                     if not line.startswith("data:"):
                         continue
-                    chunk = json.loads(line[5:].strip())
-                    piece = chunk.get("content", "")
+                    body = line[5:].strip()
+                    if body == "[DONE]":
+                        break
+                    chunk = json.loads(body)
+                    choices = chunk.get("choices") or [{}]
+                    piece = (choices[0].get("delta") or {}).get("content") or ""
                     if piece:
                         if not pieces:
                             ttft = time.time() - t0
                         pieces.append(piece)
                         if on_token:
                             on_token(piece)
-                    if chunk.get("stop"):
-                        timings = chunk.get("timings", {}) or {}
-                        tokens_predicted = int(chunk.get("tokens_predicted", 0) or 0)
+                    if chunk.get("timings"):
+                        timings = chunk["timings"]
         except urllib.error.URLError as exc:
             raise EngineError(f"engine request failed: {exc}") from exc
 
         wall = time.time() - t0
-        decode_tokens = tokens_predicted or int(timings.get("predicted_n", 0) or 0)
+        decode_tokens = int(timings.get("predicted_n", 0) or 0)
         tok_per_s = float(timings.get("predicted_per_second", 0.0) or 0.0)
+        if not decode_tokens:
+            decode_tokens = len(pieces)          # chunks ≈ tokens for this engine
         if not tok_per_s and decode_tokens and wall > 0:
             tok_per_s = decode_tokens / wall
         return {
@@ -222,6 +238,10 @@ class Engine:
             "ttft_s": round(ttft, 2),
         }
 
+    def complete(self, prompt: str, max_tokens: int, on_token=None) -> dict:
+        """Single-turn convenience wrapper over chat()."""
+        return self.chat([{"role": "user", "content": prompt}], max_tokens, on_token)
+
 
 class EngineManager:
     """Keeps exactly one Engine alive for the current pipeline.
@@ -231,9 +251,11 @@ class EngineManager:
     ladder work; everything else is a warm hit.
     """
 
-    def __init__(self, bin_dir: Path, port: int = 7970, on_event=None) -> None:
+    def __init__(self, bin_dir: Path, port: int = 7970, on_event=None,
+                 slots: int = 4) -> None:
         self.bin_dir = bin_dir
         self.port = port
+        self.slots = max(1, slots)
         self.on_event = on_event or (lambda msg: None)
         self.engine: Engine | None = None
         self.signature: tuple | None = None
@@ -257,7 +279,7 @@ class EngineManager:
                 self.bin_dir, model_path,
                 [f"{n['host']}:{n['port']}" for n in nodes],
                 [float(n["pledge_mb"]) for n in nodes],
-                self.port,
+                self.port, slots=self.slots,
             )
             self.on_event(f"engine starting: {model_path.stem} across "
                           f"{len(nodes)} node(s) [{', '.join(n['node_id'] for n in nodes)}]")

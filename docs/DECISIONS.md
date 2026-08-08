@@ -151,6 +151,17 @@ network. The coordinator now also answers `/v1/models` and
 community network only substitutes for a subscription if the community's
 existing tools can point at it unchanged.
 
+**Model catalog: hardcoded two rungs -> discovered from Hugging Face (v0.8)** ·
+The ladder shipped with a fixed 0.5B/1.5B catalog, which quietly capped the
+whole idea: a community that grows past ~2 GB had nowhere to climb.
+`sanad_net.models` now queries the Hub for free GGUF models that fit the pooled
+memory, so the ladder can reach a 30B MoE when the community is big enough. ·
+Replaced a placeholder catalog that contradicted the project's central claim
+that the network grows with its people. Kept deliberately: models are *offered*
+and added by a human, never auto-installed — licences vary and an
+auto-deploy channel is a supply-chain risk (the same reason the roadmap's
+"Scout" is PR-gated).
+
 ---
 
 ## Deliberate non-decisions

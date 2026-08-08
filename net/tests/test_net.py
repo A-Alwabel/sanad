@@ -239,6 +239,32 @@ class TestResidentEngine(unittest.TestCase):
         self.assertEqual(engines.starts, 2)
         self.assertEqual(engines.restarts, 1)
 
+    def test_reasoning_only_output_falls_back_to_thinking(self):
+        # A reasoning model can spend a short budget entirely inside <think>,
+        # leaving content empty; the engine must not return a blank answer.
+        from sanad_net.engine import Engine
+        import io, urllib.request
+        eng = Engine.__new__(Engine)
+        eng._inflight = 0; eng._idle = threading.Condition(); eng._retired = False
+        eng.base = "http://x"; eng.proc = True
+        eng.alive = lambda: True
+        events = [
+            {"choices": [{"delta": {"reasoning_content": "thinking hard"}}]},
+            {"choices": [{"delta": {"reasoning_content": " about it"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}],
+             "timings": {"predicted_n": 9, "prompt_n": 5}},
+        ]
+        sse = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
+        sse = sse.encode()
+        orig = urllib.request.urlopen
+        try:
+            urllib.request.urlopen = lambda *a, **k: io.BytesIO(sse)
+            out = eng._chat([{"role": "user", "content": "hi"}], 9, None, 0.7)
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(out["text"], "thinking hard about it",
+                         "an all-reasoning reply must fall back to the thinking text")
+
     def test_streaming_pushes_tokens_then_done(self):
         import queue
         coord, _ = mk_coord()
@@ -682,6 +708,64 @@ class TestRegressionsFromReview(unittest.TestCase):
         r = DiscoveryResponder(http_port=7899, bind="127.0.0.1")
         self.assertFalse(r.start(), "a loopback-only coordinator has nothing to discover")
         self.assertFalse(r.active)
+
+
+class TestModelDiscovery(unittest.TestCase):
+    """Picking a model from a repo listing — the logic that grows the ladder."""
+
+    def test_projectors_and_split_shards_are_handled(self):
+        from sanad_net import models
+        fake_tree = [
+            {"path": "model-Q4_K_M.gguf", "size": 5_000_000_000},
+            {"path": "model-Q8_0.gguf", "size": 9_000_000_000},
+            {"path": "mmproj-F16.gguf", "size": 700_000_000},          # a vision projector
+            {"path": "big-00001-of-00002.gguf", "size": 8_000_000_000},  # split model, part 1
+            {"path": "big-00002-of-00002.gguf", "size": 8_000_000_000},  # part 2
+            {"path": "nested/thing-Q4.gguf", "size": 1},               # not top-level
+        ]
+        orig = models.api
+        try:
+            models.api = lambda path, params=None: fake_tree
+            files = models.repo_files("acme/whatever")
+        finally:
+            models.api = orig
+        paths = {f["path"] for f in files}
+        self.assertIn("model-Q4_K_M.gguf", paths)
+        self.assertNotIn("mmproj-F16.gguf", paths, "a projector is not a model")
+        self.assertNotIn("nested/thing-Q4.gguf", paths, "nested files are skipped")
+        split = next(f for f in files if f["path"] == "big-00001-of-00002.gguf")
+        self.assertTrue(split["split"])
+        self.assertEqual(split["bytes"], 16_000_000_000, "a split model's size is all its shards")
+
+    def test_best_fitting_file_prefers_quality_within_budget(self):
+        from sanad_net.models import best_fitting_file
+        files = [
+            {"path": "m-Q4_K_M.gguf", "bytes": 5_000_000_000},
+            {"path": "m-Q8_0.gguf", "bytes": 9_000_000_000},
+            {"path": "m-Q3_K_M.gguf", "bytes": 4_000_000_000},
+        ]
+        # 6 GB budget: Q8 doesn't fit; between Q4_K_M and Q3_K_M, Q4_K_M is better.
+        pick = best_fitting_file(files, budget_mb=6000)
+        self.assertEqual(pick["path"], "m-Q4_K_M.gguf")
+        # Tiny budget: nothing fits.
+        self.assertIsNone(best_fitting_file(files, budget_mb=100))
+
+    def test_param_parsing(self):
+        from sanad_net.models import parse_params
+        self.assertEqual(parse_params("Qwen3-Coder-30B-A3B-Instruct-GGUF"), 30.0)
+        self.assertEqual(parse_params("ornith-1.0-9b-Q4_K_M"), 9.0)
+        self.assertEqual(parse_params("Llama-3.3-70B"), 70.0)
+        self.assertIsNone(parse_params("some-embedding-model"))
+
+    def test_budget_matches_the_ladder_maths(self):
+        from sanad_net.models import usable_budget
+        from sanad_net.coordinator import ModelTier
+        from pathlib import Path as _P
+        # A model whose need_mb equals the ladder's must be exactly affordable.
+        tier = ModelTier(name="m", path=_P("m.gguf"), file_mb=1000.0, slots=4)
+        pool_that_just_fits = tier.need_mb
+        # usable_budget(pool) should be >= the file size for that pool.
+        self.assertGreaterEqual(usable_budget(pool_that_just_fits), 1000.0 - 1)
 
 
 class TestOpenAICompatibility(unittest.TestCase):

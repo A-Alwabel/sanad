@@ -238,6 +238,7 @@ class Engine:
         t0 = time.time()
         ttft = 0.0
         pieces: list[str] = []
+        reasoning: list[str] = []
         timings: dict = {}
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
@@ -250,7 +251,16 @@ class Engine:
                         break
                     chunk = json.loads(body)
                     choices = chunk.get("choices") or [{}]
-                    piece = (choices[0].get("delta") or {}).get("content") or ""
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content") or ""
+                    # Reasoning models (Qwen3, DeepSeek-R1, …) stream their
+                    # thinking into a separate field and the visible answer
+                    # after it. If a short budget is spent entirely on thinking,
+                    # `content` is empty — so track the reasoning too and fall
+                    # back to it rather than handing the user a blank reply.
+                    think = delta.get("reasoning_content") or ""
+                    if think:
+                        reasoning.append(think)
                     if piece:
                         if not pieces:
                             ttft = time.time() - t0
@@ -272,8 +282,12 @@ class Engine:
             decode_tokens = len(pieces)          # chunks ≈ tokens for this engine
         if not tok_per_s and decode_tokens and wall > 0:
             tok_per_s = decode_tokens / wall
+        text = "".join(pieces).strip()
+        if not text and reasoning:
+            # The whole budget went to thinking; show it rather than nothing.
+            text = "".join(reasoning).strip()
         return {
-            "text": "".join(pieces).strip(),
+            "text": text,
             "decode_tokens": decode_tokens,
             "prompt_tokens": prompt_tokens,
             "tok_per_s": round(tok_per_s, 2),

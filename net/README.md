@@ -13,6 +13,27 @@ transcripts in [proof/artifacts/](proof/artifacts/).
 coordinator's address. You get a chat page that shows, under every answer, which
 nodes served which layers, how fast, and who earned the credits.
 
+## Grow the ladder with free models
+
+The network serves the largest model your pooled memory can hold, so a ladder
+with only two small rungs wastes a big community. `sanad_net.models` finds free
+open-weight GGUF models on Hugging Face that actually fit, ranked by how widely
+used they are:
+
+```bash
+python -m sanad_net.models                    # what your running network can serve now
+python -m sanad_net.models --pool-mb 48000    # what a 48 GB community could climb to
+python -m sanad_net.models --search qwen3     # look for a family
+python -m sanad_net.models --add unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF --quant Q4_K_M
+```
+
+It reads real file sizes and licences from the Hub (no key, stdlib only),
+skips vision projectors and reassembles split models, and only offers what fits
+after the ladder's own memory overhead. Licences are shown, never assumed —
+some open weights carry terms worth reading before you serve others with them.
+`--add` downloads the file; pass it to the coordinator's `--models` list and
+the ladder inserts it at the right rung automatically.
+
 ## Point your own tools at it
 
 The coordinator speaks the OpenAI-compatible API, so anything that already

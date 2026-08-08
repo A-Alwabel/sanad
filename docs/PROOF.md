@@ -1,6 +1,6 @@
 # Proofs that Sanad works
 
-Six milestones, all fully reproducible:
+Seven milestones, all fully reproducible:
 
 | Milestone | What it proves | Transcript | Reproduce |
 |---|---|---|---|
@@ -10,6 +10,7 @@ Six milestones, all fully reproducible:
 | **Part 4 — Usable Together** (v0.4) | One-command join, conversation memory, durable credits, concurrency | [v0.4 transcript](../net/proof/artifacts/v04-2026-08-08.txt) | [run_v04.py](../net/proof/run_v04.py) |
 | **Part 5 — Two Networks** (v0.5) | Sharding across genuinely isolated networks; WAN cost measured | [two-networks transcript](../net/proof/artifacts/two-networks-2026-08-08.txt) | [run_two_networks.py](../net/proof/run_two_networks.py) |
 | **Part 6 — For Everything** (v0.7) | An off-the-shelf OpenAI client drives Sanad unmodified | [openai-compat transcript](../net/proof/artifacts/openai-compat-2026-08-08.txt) | [run_openai_compat.py](../net/proof/run_openai_compat.py) |
+| **Part 7 — A ladder to climb** (v0.8) | A model discovered from Hugging Face, downloaded, and served with a real answer | (live, see below) | `python -m sanad_net.models` |
 
 ---
 
@@ -487,3 +488,61 @@ account, no permission — the network belongs to the people running it.
   models, and streaming.
 - The trust, privacy, scale and centralised-coordination caveats from earlier
   parts are unchanged.
+
+
+---
+
+# Part 7 — A ladder to climb (v0.8)
+
+**Date:** 2026-08-08 · **Status:** PASS
+
+The capacity ladder is the mechanism behind "the network grows with its people":
+it serves the largest model the pooled memory can hold. But it shipped with only
+two small rungs hardcoded, so a community that grew past ~2 GB had nowhere to
+climb. `sanad_net.models` fixes that by finding real models on Hugging Face that
+fit — and this milestone is the full loop, run live: **discover → download →
+serve → real answer.**
+
+## Discover — what a given community could serve
+
+```
+$ python -m sanad_net.models --pool-mb 48000
+FITS  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+      Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf  17.3 GB   5,357,567 downloads
+```
+
+Sizes and licences are read from the Hub (stdlib, no key), vision projectors
+and split shards are handled, and only what fits after the ladder's own memory
+overhead is offered. A 48 GB community can climb to a 30B MoE — six times
+anything the old catalog held.
+
+## Download and serve — the official Qwen3-4B, end to end
+
+`python -m sanad_net.models --add Qwen/Qwen3-4B-GGUF --quant Q4_K_M` fetched a
+2.3 GB Apache-2.0 model. Pointed at a Sanad network, it loaded and answered
+through the OpenAI-compatible API:
+
+> **Q:** What makes a good community?
+> **A (Qwen3-4B):** "A good community is built on mutual support, shared values,
+> and collaborative efforts toward common goals. It fosters trust, inclusivity,
+> and a sense of belonging that enhances the well-being of all its members."
+
+## Two real bugs this surfaced, fixed here
+
+- **Capacity is enforced strictly.** A 5.6 GB model with a single 6.5 GB node
+  refused to load: the ladder needs 7.8 GB pooled (weights + KV + overhead), so
+  it correctly waited for more memory. That is the point of the ladder, working.
+- **Reasoning models produced blank answers.** Qwen3 streams its thinking into a
+  separate `reasoning_content` field; a short token budget was spent entirely
+  there, leaving the visible answer empty. The engine now tracks reasoning and
+  falls back to it, and the coordinator flags a model that generates tokens but
+  no readable text (an unsupported chat template) instead of serving silence.
+
+## What Part 7 does not do
+
+- Models are **offered and added by a human, never auto-installed.** Licences
+  vary — some open weights carry terms worth reading — and an auto-deploy
+  channel is a supply-chain risk. This is the same reason the roadmap's "Scout"
+  is PR-gated.
+- Quality ranking is by download count, a popularity signal with known biases,
+  not a benchmark.

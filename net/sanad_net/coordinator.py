@@ -389,6 +389,16 @@ class Coordinator:
             failure.job_start_ts = job_start_ts
             raise failure from exc
 
+        # A model can generate tokens that decode to nothing — a broken or
+        # unsupported chat template producing only special tokens. The engine
+        # already falls back to reasoning content, so a still-empty answer here
+        # means the template is genuinely unusable. Flag it: a blank reply is
+        # worse than an honest error.
+        if result["decode_tokens"] > 3 and not result["text"].strip():
+            self._event(f"WARNING model '{tier.name}' produced {result['decode_tokens']} "
+                        "tokens but no readable text - its chat template is likely "
+                        "unsupported. Try a model with a standard template.")
+
         # Layer-share weighted credits: memory lent == layers held == share earned.
         tokens = result["decode_tokens"]
         shard_map = engine.shard_map or {}

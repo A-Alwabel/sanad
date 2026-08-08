@@ -56,14 +56,26 @@ own devices can reach, which is what makes this safe to do at all.
 
 ### Steps
 
-**a. Get a free VM.** Oracle Cloud "Always Free" gives an Ampere ARM instance
-(2 OCPU / 12 GB as of June 2026) that does not expire. Google Cloud's
-`e2-micro` Always Free is the x86-64 alternative (1 GB RAM — still enough,
-since a node holds only a *slice* of the model). A GitHub Codespace works for a
-quick demo but stops when idle.
+**a. Get a free VM.** Options, easiest signup first (verified August 2026 —
+free tiers move, so re-check):
 
-**b. Join both machines to a private mesh.** [Tailscale](https://tailscale.com)
-is free for personal use and needs no inbound firewall rules on either side:
+| Host | Signup | RAM | Notes |
+|---|---|---|---|
+| [Segfault](https://www.thc.org/segfault) | **none at all** — `ssh root@segfault.net` (password `segfault`) | ~2 GB (confirm with `cat /sys/fs/cgroup/memory.max` on login) | root Linux, no email, no card; keep a `tmux` session alive so it isn't reclaimed. Ask in their ops channel before running many nodes — it's a donated service. |
+| Oracle Cloud Always Free | account + card (identity only) | 12 GB (Ampere ARM) | does not expire; ARM needs a source build |
+| Google Cloud `e2-micro` | account + card | 1 GB (x86-64) | enough for one shard |
+
+Avoid the "free VPS, no card" listicles — those hosts are abused within hours
+and effectively don't exist. And do **not** try to run nodes inside GitHub
+Actions or Google Colab: both forbid it in writing and you can lose the whole
+account.
+
+**b. Connect the node to your coordinator.** Two ways, depending on how
+account-averse you are.
+
+*Private mesh (needs a free account, gives stable addresses):*
+[Tailscale](https://tailscale.com) is free for personal use and needs no
+inbound firewall rules on either side:
 
 ```bash
 # on the VM
@@ -71,6 +83,23 @@ curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
 # on your own machine: install Tailscale, sign in to the same account
 tailscale ip -4        # note the VM's 100.x address
 ```
+
+*No account at all (the node dials out to your coordinator):* have the node
+open an outbound tunnel and bind the rpc-server to loopback, so the auth-less
+port is never exposed. [gsocket](https://gsocket.io) needs no account, no card,
+and traverses any NAT:
+
+```bash
+# on the node: rpc-server on localhost only, reached through the tunnel
+gs-netcat -l -d 127.0.0.1 -p 50052 -s <a-secret-you-invent>
+# on your coordinator's machine: expose it locally
+gs-netcat -p 50052 -s <the-same-secret>   # now localhost:50052 reaches the node
+```
+
+This flips the requirement from "reachable inbound" (rare) to "outbound
+allowed" (nearly universal), which is what makes zero-account hosts usable.
+Plain `ssh -R 50052:localhost:50052 you@your-coordinator` does the same with no
+third party if you have an SSH host.
 
 **c. Get llama.cpp on the VM.** On an x86-64 VM, let Sanad fetch it:
 

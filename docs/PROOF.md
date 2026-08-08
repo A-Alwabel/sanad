@@ -1,11 +1,12 @@
 # Proofs that Sanad works
 
-Two milestones, both achieved 2026-08-05, both fully reproducible:
+Three milestones, all fully reproducible:
 
 | Milestone | What it proves | Transcript | Reproduce |
 |---|---|---|---|
 | **Part 1 — First Light** (v0.1) | Real sharded inference + live credit economy | [first-light transcript](../net/proof/artifacts/first-light-2026-08-05.txt) | [run_first_light.py](../net/proof/run_first_light.py) |
 | **Part 2 — The Living Network** (v0.2) | Capacity ladder + polite node + weighted fairness | [living-network transcript](../net/proof/artifacts/living-network-2026-08-05.txt) | [run_living_network.py](../net/proof/run_living_network.py) |
+| **Part 3 — It Works** (v0.3) | Resident pipeline, live streaming, chat UI, real LAN | [it-works transcript](../net/proof/artifacts/it-works-2026-08-08.txt) | [run_it_works.py](../net/proof/run_it_works.py) |
 
 ---
 
@@ -189,7 +190,71 @@ Everything in Part 1's "what this does NOT prove" list still stands
 (single machine, trusted nodes, small models, no privacy) — minus per-request
 politeness and dynamic capacity, which are now real.
 
+---
+
+# Part 3 — It Works (v0.3)
+
+**Date:** 2026-08-08 · **Status:** PASS · **Raw transcript:** [net/proof/artifacts/it-works-2026-08-08.txt](../net/proof/artifacts/it-works-2026-08-08.txt) · **Reproduce:** [net/proof/run_it_works.py](../net/proof/run_it_works.py)
+
+Parts 1 and 2 showed the network is *correct*. This one shows it is *usable* —
+and it runs over the machine's real LAN address (192.168.0.188), not loopback,
+so the traffic crosses the actual network stack and the nodes advertise
+dialable addresses.
+
+## A. The pipeline is resident — the reload is gone
+
+v0.2 spawned a fresh engine per request, re-streaming the model to every node
+before a single token could appear. v0.3 keeps a `llama-server` alive holding
+the sharded pipeline. Measured in the same run:
+
+```
+COLD  first token after 5.17s   (32 tokens, 57.92 tok/s)  engine_warm=False
+WARM  first token after 0.07s   (32 tokens, 43.21 tok/s)  engine_warm=True
+-> time-to-first-token improved 75.0x once the pipeline was resident
+```
+
+(Cold-start cost varies with disk cache and machine load — repeat runs measured
+between 5.2s and 7.3s, i.e. 75x–99x. The warm figure was stable at ~0.07s. The
+committed transcript is the 75x run; the assertion is that warm beats cold, not
+a particular multiple.)
+
+The engine rebuilds only when the pipeline actually changes — a node joining or
+leaving, or the capacity ladder moving tier. The proof asserts zero restarts
+across the two warm requests, then ≥1 restart after a second node joins.
+
+## B. Tokens stream
+
+`POST /ask/stream` emits server-sent events as generation happens. From the
+captured run: **32 chunks spread over 0.91s**, first at 0.10s and last at
+1.01s — not one lump at the end. The proof asserts the streamed text matches
+the final answer exactly.
+
+## C. A person can use it
+
+`GET /` serves a chat page from the coordinator. It was verified by driving it
+in a real browser: typing a question, watching tokens arrive, and reading the
+per-answer footer that names the nodes that served it
+(`RPC0 192.168.0.188:50120 layers 0-24`), the model, the speed, whether the
+pipeline was warm, and which operators were credited.
+
+## D. The ladder still holds, with the engine following it
+
+A second node joined → the ladder upgraded to the 1.5B model → the engine
+rebuilt for the new two-node pipeline (layers **0–11** and **12–28**) → the
+following request was warm again at 0.15s. Credits stayed weighted by layer
+share (amina 1000 MB pledge earned more than bilal's 700 MB).
+
+## What Part 3 still does not prove
+
+- **Still one physical machine.** Processes now talk over the real LAN
+  interface with dialable addresses, which is the last step before two houses —
+  but it is not two houses yet.
+- The trust, privacy, and scale caveats from Part 1 are unchanged: trusted
+  operators, nodes can reconstruct prompts from activations, small models.
+- The engine is coordinator-local by design in v0 (`llama-server` binds
+  loopback); nodes are the distributed part.
+
 ## Next milestone
 
 Two nodes on **two different machines on two different networks**, same proofs
-— then a resident pipeline, then the audit hooks from the roadmap.
+— then the audit hooks from the roadmap.

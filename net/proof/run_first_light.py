@@ -9,8 +9,8 @@ Run from the `net/` directory:
     python proof/run_first_light.py --llama-bin ../.local/bin \
         --model ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-Requirements: llama.cpp Windows binaries (llama-completion.exe + ggml-rpc-server.exe)
-and a small GGUF model. See net/README.md for download instructions.
+Requirements: llama.cpp binaries (llama-server + ggml-rpc-server) and a small
+GGUF model. See net/README.md for download instructions.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def main() -> None:
 
     try:
         section("1. Starting the Sanad network (1 coordinator + 2 nodes)")
-        spawn(["sanad_net.coordinator", "--port", "7861", "--models", model, "--llama-bin", llama_bin])
+        spawn(["sanad_net.coordinator", "--port", "7861", "--models", model, "--llama-bin", llama_bin, "--engine-port", "7971"])
         time.sleep(1.5)
         spawn(["sanad_net.node", "--node-id", "riyadh-a", "--operator", "amina",
                "--port", "50070", "--coordinator", COORD, "--rpc-bin", llama_bin])
@@ -139,8 +139,8 @@ def main() -> None:
             p.terminate()
         # node.py's SIGTERM handler cannot run under TerminateProcess on Windows,
         # so reap any orphaned rpc-servers explicitly.
-        subprocess.run(["taskkill", "/F", "/IM", "ggml-rpc-server.exe"],
-                       capture_output=True)
+        for image in ("ggml-rpc-server.exe", "llama-server.exe"):
+            subprocess.run(["taskkill", "/F", "/IM", image], capture_output=True)
 
 
 if __name__ == "__main__":

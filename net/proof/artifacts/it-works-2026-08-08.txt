@@ -1,0 +1,59 @@
+
+==========================================================================
+  0. Real network: coordinator and nodes bind to 192.168.0.188, not loopback
+==========================================================================
+[riyadh-a] SERVING on 192.168.0.188:50110 (pledge 1000 MB, low OS priority, operator amina)
+machine LAN address: 192.168.0.188  ->  coordinator at http://192.168.0.188:7863
+registered node advertises 192.168.0.188:50110  (model: qwen2.5-0.5b-instruct-q4_k_m)
+
+==========================================================================
+  A. RESIDENT PIPELINE - cold start once, then warm forever
+==========================================================================
+COLD  first token after 5.17s  (32 tokens, 57.92 tok/s)  engine_warm=False
+WARM  first token after 0.07s  (32 tokens, 43.21 tok/s)  engine_warm=True
+-> time-to-first-token improved 75.0x once the pipeline was resident
+
+==========================================================================
+  B. STREAMING - tokens arrive progressively, not in one lump
+==========================================================================
+32 chunks over 0.74s   first@0.07s  last@0.81s
+answer: Apples, oranges, bananas. 
+
+I'm not sure what you mean by "three fruits." Can you please provide more information or clarify your question? If
+
+==========================================================================
+  C. THE CHAT UI - a person can use this without a terminal
+==========================================================================
+GET /  ->  200  text/html; charset=utf-8  (10957 bytes)
+-> open http://192.168.0.188:7863/ in any browser on this network and start typing
+
+==========================================================================
+  D. THE LADDER STILL HOLDS - second node joins, model upgrades, engine rebuilds
+==========================================================================
+[jeddah-b] SERVING on 192.168.0.188:50111 (pledge 700 MB, low OS priority, operator bilal)
+model now: qwen2.5-1.5b-instruct-q4_k_m   first token after 8.29s
+shard map: {
+  "RPC0": {
+    "endpoint": "192.168.0.188:50111",
+    "layers": "0-11",
+    "n_layers": 12
+  },
+  "RPC1": {
+    "endpoint": "192.168.0.188:50110",
+    "layers": "12-28",
+    "n_layers": 17
+  }
+}
+next request on the new pipeline: engine_warm=True, first token after 0.13s
+
+==========================================================================
+  E. CREDITS - still weighted by layer share, settled per request
+==========================================================================
+{
+  "amina": 101.51700000000001,
+  "bilal": 26.482999999999997
+}
+
+==========================================================================
+  IT WORKS: PASS - resident pipeline, live streaming, chat UI, real LAN
+==========================================================================

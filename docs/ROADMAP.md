@@ -31,6 +31,14 @@ scrutiny from the people who built the priors.
   always comes first, withdrawal never punished), layer-share weighted credits
   (memory lent == share earned, enforced via --tensor-split), and chain-repair
   retry.
+- **DONE 2026-08-08 — v0.3 "It Works"** ([PROOF.md](PROOF.md) Part 3): the
+  pipeline is resident (time-to-first-token 5.17s → 0.07s in the captured run),
+  tokens stream as they are generated, a chat page at `GET /` makes the network
+  usable without a terminal, the node runs on Windows/Linux/macOS with native
+  per-platform CPU sensing, and the whole proof runs over the machine's real LAN
+  address instead of loopback. This closes the "resident pipeline" item that
+  Phase 1 listed as next work; the remaining Phase 1 gap is genuinely
+  multi-machine operation.
 - **IN REVIEW — RFC 0001 "The Human Loop"** ([rfc/0001-human-loop.md](rfc/0001-human-loop.md)):
   community feedback (thumbs + duels) earning capped, vested credits; integrity
   layer before the first credit is paid; community-owned open preference

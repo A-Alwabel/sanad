@@ -4,10 +4,11 @@
 
 **Sanad** (Arabic: *سند*, "support" — and the classical term for the **chain of transmission** that carries knowledge from person to person, each link vouching for the next) is a community inference network for large open-weight language models. Nodes each hold a *slice* of a model's layers; chained together, they serve models none of them could run alone. Contributing compute earns **non-tradeable credits** that give you priority when you use the network.
 
-**Status: the network is alive (v0.2, 2026-08-05).** Two proven milestones in one day, both with full captured transcripts in [docs/PROOF.md](docs/PROOF.md):
+**Status: it works, and you can use it (v0.3).** Three proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
 
 - **First Light** — a real model's layers physically split across two node processes over TCP, real text generated through the chain, credits earned by serving and spent as priority.
-- **The Living Network** — the network now *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it — a request submitted after every transition was served); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself, returning all memory → rejoined by itself when the machine calmed); and credits are **weighted by layer share**, so memory lent equals share earned — with balances fully kept when a node withdraws. Your device, your priority, always.
+- **The Living Network** — the network *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself → rejoined by itself when the machine calmed); and credits are **weighted by layer share**. Your device, your priority, always.
+- **It Works** — the pipeline is now **resident**, so the model is not reloaded per question: time-to-first-token dropped from **5.17s to 0.07s (75x)** in the captured run. Tokens **stream** as they are generated, there's a **chat page** at the coordinator's address that anyone can use in a browser, and it all runs over a **real LAN address**, not loopback.
 
 Still day one: single-machine, trusted nodes, small models — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
@@ -62,12 +63,16 @@ Honesty is a design principle here (over-promising is how this field loses trust
 
 ## Try it
 
-**The real thing** ([net/](net/)) — actual sharded inference through llama.cpp's RPC backend, with Sanad's coordinator and credit ledger on top (needs the llama.cpp binaries + a small GGUF model, setup in [net/README.md](net/README.md)):
+**The real thing** ([net/](net/)) — actual sharded inference through llama.cpp, with Sanad's coordinator, credit ledger, and chat page on top (needs the llama.cpp binaries + a small GGUF model, setup in [net/README.md](net/README.md)):
 
 ```bash
 cd net
 python -m unittest discover -s tests -v      # unit tests, no binaries needed
-python proof/run_first_light.py              # full network + proof, ends in "FIRST LIGHT: PASS"
+python proof/run_it_works.py                 # full network + proof, ends in "IT WORKS: PASS"
+
+# or just run it and open the chat page in a browser:
+python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0 --models <small.gguf>,<large.gguf> --llama-bin ../.local/bin
+python -m sanad_net.node --node-id mynode --operator me --host 0.0.0.0 --port 50070 --pledge-mb 1000 --rpc-bin ../.local/bin --coordinator http://<your-ip>:7860
 ```
 
 **The simulation** ([prototype/](prototype/)) — dependency-free model of the network semantics (sharding, pipeline assembly, credit priority), useful for understanding and testing the fairness logic:

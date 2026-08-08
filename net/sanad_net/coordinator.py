@@ -1,32 +1,25 @@
-"""Sanad coordinator v0.2.1 — "the living network", hardened.
+"""Sanad coordinator v0.3 — "it actually works".
 
-v0.2 added: capacity ladder, memory pledges, layer-share weighted credits,
-graceful membership, wallet-style statement.
+What changed from v0.2.1: the engine is now **resident**. v0.2.1 spawned a
+fresh llama-completion per request, re-streaming the model to every node each
+time (~5-6 s before the first token). Now a llama-server holds the sharded
+pipeline in the nodes' memory and answers immediately, with tokens streaming as
+they are produced. The pipeline is rebuilt only when it actually changes — a
+node joining or leaving, or the capacity ladder moving tier.
 
-v0.2.1 hardens the scheduler and accounting after an adversarial review:
-- **Anti-starvation**: every third queue slot is served strictly
-  first-come-first-served regardless of credits, so zero-credit users are
-  served within bounded time even under sustained contributor load.
-- **Escrow accounting**: a job's expected cost (max_tokens) is escrowed at
-  submit and settled after the run (refund or nothing further); cancelled,
-  timed-out, and failed jobs are refunded. Concurrent jobs can no longer all
-  inherit priority from the same unspent balance.
-- **Cancellation**: a job whose submitter timed out waiting is skipped (and
-  refunded) instead of running unobserved and charging for a discarded result.
-- **Distinct failures**: CapacityError (no nodes / pool too small) fails fast;
-  ChainFailure (pipeline execution failed, incl. engine timeout) triggers one
-  repair retry that first evicts pipeline nodes with no heartbeat since the
-  job started, then waits past a heartbeat period so live nodes re-appear.
-- **Accounting guard**: if the engine log cannot prove who served which
-  layers, nobody is charged and nobody is paid — an event records the loss.
-- **Thread-safe ladder events**; /status no longer mutates the event log.
+Also new: a web chat UI anyone can use (GET /), server-sent-event streaming
+(POST /ask/stream), and cross-platform node support.
 
-Still honest v0: centralized-but-open coordinator, trusted operators and
-trusted clients (identity unauthenticated), one inference at a time, model
-reloaded per request. See docs/ARCHITECTURE.md.
+Carried over from v0.2.1: capacity ladder, memory pledges enforced as layer
+shares, layer-share-weighted credits, escrow accounting with refunds,
+anti-starvation scheduling, graceful membership, wallet statement.
+
+Honest v0 scope: coordinator is centralized-but-open, operators and clients are
+trusted (identity is unauthenticated), one inference at a time. See
+docs/ARCHITECTURE.md.
 
 Usage:
-    python -m sanad_net.coordinator --port 7860 \
+    python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0 \
         --models ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf,../.local/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
         --llama-bin ../.local/bin
 """
@@ -36,8 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
-import subprocess
+import queue
 import threading
 import time
 from collections import deque
@@ -45,13 +37,15 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .engine import EngineError, EngineManager
 from .ledger import Ledger
 
-NODE_TTL_S = 15.0          # node considered dead if no heartbeat within this window
-POOL_SAFETY_FACTOR = 1.4   # model needs file_size * factor of pooled memory (KV + overhead)
-MAX_TOKENS_CAP = 512       # per-request generation cap
-MAX_PLEDGE_MB = 1_000_000  # 1 TB — sanity bound; also rejects Infinity/NaN smuggled via JSON
+NODE_TTL_S = 15.0           # node considered dead if no heartbeat within this window
+POOL_SAFETY_FACTOR = 1.4    # model needs file_size * factor of pooled memory (KV + overhead)
+MAX_TOKENS_CAP = 512        # per-request generation cap
+MAX_PLEDGE_MB = 1_000_000   # 1 TB — sanity bound; also rejects Infinity/NaN from JSON
 MAX_BODY_BYTES = 1_048_576  # 1 MB request-body cap
+WEBUI = Path(__file__).parent / "webui.html"
 
 
 class CapacityError(RuntimeError):
@@ -59,10 +53,7 @@ class CapacityError(RuntimeError):
 
 
 class ChainFailure(RuntimeError):
-    """The assembled pipeline failed to execute. Repairable once.
-
-    May carry `node_ids` (the pipeline that failed) and `job_start_ts`.
-    """
+    """The pipeline failed to execute. Repairable once."""
 
     node_ids: list[str] = []
     job_start_ts: float = 0.0
@@ -143,110 +134,24 @@ def pick_tier(catalog: list[ModelTier], pool_mb: float) -> ModelTier | None:
     return fitting[-1] if fitting else None
 
 
-def parse_llama_log(stderr_text: str) -> dict:
-    """Extract sharding proof and performance numbers from llama.cpp's log.
-
-    Format observed on llama.cpp b10276 (verbose mode):
-      ... llama_prepare_model_devices: using device RPC0 (127.0.0.1:50060) ...
-      ... load_tensors: layer   5 assigned to device RPC0, is_swa = 0
-      ... common_perf_print:        eval time = 1025.62 ms / 31 runs (33.08 ms per token, 30.23 tokens per second)
-
-    llama.cpp logs each layer assignment once per load pass (2 passes observed);
-    only the LAST assignment per layer is the final placement.
-    """
-    devices: dict[str, str] = {}
-    final_assignment: dict[int, str] = {}
-    tokens = 0
-    tok_per_s = 0.0
-    for ln in stderr_text.splitlines():
-        m = re.search(r"using device (RPC\d+) \(([^)]+)\)", ln)
-        if m:
-            devices[m.group(1)] = m.group(2)
-            continue
-        m = re.search(r"load_tensors: layer\s+(\d+) assigned to device (\S+?),", ln)
-        if m:
-            final_assignment[int(m.group(1))] = m.group(2)
-            continue
-        if "eval time" in ln and "prompt eval" not in ln:
-            m = re.search(
-                r"eval time\s*=\s*[\d.]+\s*ms\s*/\s*(\d+)\s*runs?\s*\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second",
-                ln,
-            )
-            if m:
-                tokens = int(m.group(1))
-                tok_per_s = float(m.group(2))
-    layers: dict[str, list[int]] = {}
-    for layer, dev in final_assignment.items():
-        layers.setdefault(dev, []).append(layer)
-    shard_map = {
-        dev: {
-            "endpoint": devices.get(dev, "?"),
-            "layers": f"{min(idx)}-{max(idx)}",
-            "n_layers": len(idx),
-        }
-        for dev, idx in sorted(layers.items())
-    }
-    return {"shard_map": shard_map, "decode_tokens": tokens, "tok_per_s": tok_per_s}
-
-
-class InferenceRunner:
-    """Wraps llama-completion --rpc. Injectable for tests."""
-
-    def __init__(self, llama_bin_dir: Path) -> None:
-        # llama.cpp >= b10xxx: llama-cli is interactive-first; llama-completion
-        # is the non-interactive one-shot tool suited to subprocess use.
-        self.llama_bin = llama_bin_dir / "llama-completion.exe"
-        self.bin_dir = llama_bin_dir
-
-    def run(self, model_path: Path, prompt: str, rpc_servers: list[str],
-            tensor_split: list[float], max_tokens: int) -> dict:
-        cmd = [
-            str(self.llama_bin),
-            "-m", str(model_path),
-            "--rpc", ",".join(rpc_servers),
-            "-ngl", "99",
-            "--tensor-split", ",".join(f"{s:g}" for s in tensor_split),
-            "-n", str(max_tokens),
-            "-p", prompt,
-            "--temp", "0",
-            "--seed", "42",
-            "-no-cnv",
-            "--no-display-prompt",
-            "--simple-io",
-            "-v",  # verbose: exposes per-layer device assignment for the shard map
-        ]
-        t0 = time.time()
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=600, cwd=str(self.bin_dir),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ChainFailure(f"llama-completion timed out after 600s") from exc
-        wall_s = time.time() - t0
-        if proc.returncode != 0:
-            raise ChainFailure(f"llama-completion failed (rc={proc.returncode}): {proc.stderr[-800:]}")
-        stats = parse_llama_log(proc.stderr)
-        return {"text": proc.stdout.strip(), "wall_s": round(wall_s, 2), **stats}
-
-
 class Coordinator:
-    RETRY_DELAY_S = 4.0        # > heartbeat period, so live nodes re-appear before the retry
+    RETRY_DELAY_S = 4.0        # > heartbeat period, so live nodes re-appear before a retry
     FIFO_EVERY = 3             # every Nth slot is strictly first-come-first-served
 
-    def __init__(self, runner: InferenceRunner, catalog: list[ModelTier]) -> None:
+    def __init__(self, engines: EngineManager, catalog: list[ModelTier]) -> None:
         self.registry = Registry()
         self.ledger = Ledger()
-        self.runner = runner
+        self.engines = engines
         self.catalog = catalog
         self.jobs_done = 0
-        self.events: deque[dict] = deque(maxlen=1000)  # bounded audit trail
+        self.events: deque[dict] = deque(maxlen=1000)
         self._last_tier: str | None = None
         self._tier_lock = threading.Lock()
         self._pending: list[dict] = []
         self._cv = threading.Condition()
         self._served = 0
         self._seq = 0
+        engines.on_event = self._event
         threading.Thread(target=self._worker_loop, daemon=True).start()
 
     # -- capacity ladder -----------------------------------------------------
@@ -263,7 +168,8 @@ class Coordinator:
             if name != self._last_tier:
                 direction = "UP" if (
                     self._last_tier is None
-                    or (tier and any(t.name == self._last_tier and t.file_mb < tier.file_mb for t in self.catalog))
+                    or (tier and any(t.name == self._last_tier and t.file_mb < tier.file_mb
+                                     for t in self.catalog))
                 ) else "DOWN"
                 self._event(f"LADDER {direction}: model -> {name or 'none fits'} "
                             f"(pool {pool_mb:.0f} MB across {len(nodes)} nodes)")
@@ -274,8 +180,13 @@ class Coordinator:
         self.events.append({"ts": round(time.time(), 2), "event": msg})
 
     # -- job scheduling ------------------------------------------------------
-    def submit(self, user: str, prompt: str, max_tokens: int, timeout_s: float = 900.0) -> dict:
-        """Blocking: enqueue with credit priority (escrowed), wait for the result."""
+    def submit(self, user: str, prompt: str, max_tokens: int,
+               timeout_s: float = 900.0, stream_q: "queue.Queue | None" = None) -> dict:
+        """Blocking: enqueue with credit priority (escrowed), wait for the result.
+
+        If `stream_q` is given, token chunks are pushed onto it as ("token", text)
+        while the job runs; the caller must drain it concurrently.
+        """
         with self._cv:
             self._seq += 1
             seq = self._seq
@@ -283,7 +194,7 @@ class Coordinator:
         escrow = self.ledger.spend(user, float(max_tokens), f"escrow for job #{seq}")
         job = {
             "seq": seq, "priority": priority, "user": user, "prompt": prompt,
-            "max_tokens": max_tokens, "escrow": escrow,
+            "max_tokens": max_tokens, "escrow": escrow, "stream_q": stream_q,
             "done": threading.Event(), "slot": {}, "cancelled": False, "started": False,
         }
         with self._cv:
@@ -302,8 +213,8 @@ class Coordinator:
         return job["slot"]["result"]
 
     def _pop_next_locked(self) -> dict:
-        """Pick the next job. Every FIFO_EVERY-th slot is strictly by arrival
-        order — the anti-starvation reserve that keeps zero-credit users moving."""
+        """Every FIFO_EVERY-th slot is strictly by arrival order — the
+        anti-starvation reserve that keeps zero-credit users moving."""
         self._served += 1
         if self._served % self.FIFO_EVERY == 0:
             job = min(self._pending, key=lambda j: j["seq"])
@@ -325,28 +236,32 @@ class Coordinator:
                 job["started"] = True
             try:
                 job["slot"]["result"] = self._run_job_with_repair(job)
+                if job["stream_q"] is not None:
+                    job["stream_q"].put(("done", job["slot"]["result"]))
             except Exception as exc:
-                job["slot"]["error"] = f"{type(exc).__name__}: {exc}"
+                msg = f"{type(exc).__name__}: {exc}"
+                job["slot"]["error"] = msg
                 if job["escrow"] > 0:
                     self.ledger.earn(job["user"], job["escrow"],
                                      f"escrow refund (job #{job['seq']} failed)")
+                if job["stream_q"] is not None:
+                    job["stream_q"].put(("error", msg))
             finally:
                 job["done"].set()
 
     def _run_job_with_repair(self, job: dict) -> dict:
-        """Chain repair: on pipeline failure, evict nodes with no heartbeat since
-        the job started (likely dead), wait past a heartbeat period so live
-        nodes re-appear, and retry once with the survivors. Capacity errors
-        fail fast — retrying cannot create nodes."""
+        """On pipeline failure, evict nodes with no heartbeat since the job
+        started, wait past a heartbeat period so live nodes re-appear, rebuild
+        the engine, and retry once. Capacity errors fail fast."""
         try:
             return self._run_job(job)
         except ChainFailure as exc:
-            stale = [nid for nid in exc.node_ids
-                     if self.registry.last_seen(nid) < exc.job_start_ts]
+            stale = [nid for nid in exc.node_ids if self.registry.last_seen(nid) < exc.job_start_ts]
             for nid in stale:
                 self.registry.suspect(nid)
+            self.engines.invalidate()
             self._event(f"chain failed - suspected {stale or 'no'} stale nodes; "
-                        "retrying with survivors")
+                        "rebuilding engine and retrying")
             time.sleep(self.RETRY_DELAY_S)
             return self._run_job(job, repaired=True)
 
@@ -357,44 +272,46 @@ class Coordinator:
         if tier is None:
             raise CapacityError(f"pool of {pool_mb:.0f} MB cannot hold any catalog model")
 
-        rpc_servers = [f"{n['host']}:{n['port']}" for n in nodes]
-        tensor_split = [n["pledge_mb"] for n in nodes]  # layer share follows the pledge
         job_start_ts = time.time()
         try:
-            result = self.runner.run(tier.path, job["prompt"], rpc_servers,
-                                     tensor_split, job["max_tokens"])
-        except ChainFailure as exc:
-            exc.node_ids = [n["node_id"] for n in nodes]
-            exc.job_start_ts = job_start_ts
-            raise
+            engine = self.engines.ensure(tier.path, nodes)
+            on_token = None
+            if job["stream_q"] is not None:
+                on_token = lambda t: job["stream_q"].put(("token", t))  # noqa: E731
+            result = engine.complete(job["prompt"], job["max_tokens"], on_token=on_token)
+        except EngineError as exc:
+            failure = ChainFailure(str(exc))
+            failure.node_ids = [n["node_id"] for n in nodes]
+            failure.job_start_ts = job_start_ts
+            raise failure from exc
 
         # Layer-share weighted credits: memory lent == layers held == share earned.
         tokens = result["decode_tokens"]
-        shard_map = result.get("shard_map", {})
-        known_devices = {f"RPC{i}" for i in range(len(nodes))}
-        provable = tokens > 0 and shard_map and set(shard_map) <= known_devices
+        shard_map = engine.shard_map or {}
+        known = {f"RPC{i}" for i in range(len(nodes))}
+        provable = tokens > 0 and shard_map and set(shard_map) <= known
         if provable:
             total_layers = sum(d["n_layers"] for d in shard_map.values())
-            # RPC device order follows the --rpc list order == `nodes` order.
-            for i, n in enumerate(nodes):
+            for i, n in enumerate(nodes):   # RPC device order follows the --rpc list order
                 n_layers = shard_map.get(f"RPC{i}", {}).get("n_layers", 0)
                 share = tokens * (n_layers / total_layers)
                 if share > 0:
                     self.ledger.earn(
                         n["operator"], round(share, 3),
-                        f"served {n_layers}/{total_layers} layers of {tier.name} for {tokens} tokens via {n['node_id']}",
+                        f"served {n_layers}/{total_layers} layers of {tier.name} "
+                        f"for {tokens} tokens via {n['node_id']}",
                     )
-            # Settle escrow: refund the unused part; low-balance users owe nothing more.
             refund = job["escrow"] - float(tokens)
             if refund > 0:
-                self.ledger.earn(job["user"], refund, f"escrow refund (job #{job['seq']} used {tokens} tokens)")
+                self.ledger.earn(job["user"], refund,
+                                 f"escrow refund (job #{job['seq']} used {tokens} tokens)")
         else:
-            # Unproven serving is unpaid serving — and an uncharged request.
             if job["escrow"] > 0:
                 self.ledger.earn(job["user"], job["escrow"],
                                  f"escrow refund (job #{job['seq']}: shard map unprovable)")
             self._event(f"WARNING job #{job['seq']}: engine log unprovable "
-                        f"(tokens={tokens}, devices={sorted(shard_map)}) - no credits minted or charged")
+                        f"(tokens={tokens}, devices={sorted(shard_map)}) - "
+                        "no credits minted or charged")
         self.jobs_done += 1
         return {
             "user": job["user"],
@@ -402,6 +319,8 @@ class Coordinator:
             "priority_at_submit": -job["priority"],
             "repaired": repaired,
             "pool_mb": round(pool_mb, 1),
+            "engine_warm": engine.started_at < job_start_ts,
+            "shard_map": shard_map,
             "pipeline": [
                 {"node_id": n["node_id"], "endpoint": f"{n['host']}:{n['port']}",
                  "operator": n["operator"], "pledge_mb": n["pledge_mb"]}
@@ -412,12 +331,19 @@ class Coordinator:
 
     def status(self) -> dict:
         tier, nodes, pool_mb = self._compute_tier()
+        eng = self.engines.engine
         return {
             "model": tier.name if tier else None,
             "pool_mb": round(pool_mb, 1),
-            "catalog": [{"name": t.name, "file_mb": round(t.file_mb, 1), "need_mb": round(t.need_mb, 1)}
-                        for t in self.catalog],
+            "catalog": [{"name": t.name, "file_mb": round(t.file_mb, 1),
+                         "need_mb": round(t.need_mb, 1)} for t in self.catalog],
             "nodes": nodes,
+            "engine": {
+                "resident": bool(eng and eng.alive()),
+                "load_s": eng.load_s if eng else None,
+                "restarts": self.engines.restarts,
+                "shard_map": eng.shard_map if eng else {},
+            },
             "balances": self.ledger.balances(),
             "jobs_done": self.jobs_done,
             "events": list(self.events)[-20:],
@@ -426,6 +352,8 @@ class Coordinator:
 
 def make_handler(coord: Coordinator):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, fmt, *args):  # quiet
             pass
 
@@ -444,16 +372,65 @@ def make_handler(coord: Coordinator):
             return json.loads(self.rfile.read(length) or b"{}")
 
         def do_GET(self):
-            if self.path == "/status":
+            if self.path in ("/", "/index.html", "/chat"):
+                try:
+                    body = WEBUI.read_bytes()
+                except OSError:
+                    self._json(404, {"error": "web UI not installed"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/status":
                 self._json(200, coord.status())
             elif self.path.startswith("/ledger"):
-                entries = [
+                self._json(200, {"entries": [
                     {"ts": round(e.ts, 2), "account": e.account, "delta": e.delta, "reason": e.reason}
                     for e in coord.ledger.entries()
-                ]
-                self._json(200, {"entries": entries})
+                ]})
             else:
                 self._json(404, {"error": "unknown path"})
+
+        def _parse_ask(self, data: dict) -> tuple[str, str, int]:
+            raw = data.get("max_tokens", 48)
+            if isinstance(raw, float) and not math.isfinite(raw):
+                raise ValueError("max_tokens must be finite")
+            return (str(data.get("user", "anon")), str(data["prompt"]),
+                    max(1, min(int(raw), MAX_TOKENS_CAP)))
+
+        def _stream_ask(self, data: dict) -> None:
+            user, prompt, max_tokens = self._parse_ask(data)
+            q: queue.Queue = queue.Queue()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def run():
+                try:
+                    coord.submit(user, prompt, max_tokens, stream_q=q)
+                except Exception as exc:
+                    q.put(("error", f"{type(exc).__name__}: {exc}"))
+
+            threading.Thread(target=run, daemon=True).start()
+            while True:
+                kind, payload = q.get()
+                if kind == "token":
+                    ev = {"type": "token", "text": payload}
+                elif kind == "done":
+                    ev = {"type": "done", "result": payload}
+                else:
+                    ev = {"type": "error", "error": payload}
+                try:
+                    self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return          # client closed; the job still completes and settles
+                if kind in ("done", "error"):
+                    return
 
         def do_POST(self):
             try:
@@ -463,11 +440,9 @@ def make_handler(coord: Coordinator):
                     # Python's json accepts Infinity/NaN — an infinite pledge would
                     # pin the ladder to the largest tier and NaN would poison math.
                     if not math.isfinite(pledge) or not 0 < pledge <= MAX_PLEDGE_MB:
-                        raise ValueError(f"pledge_mb must be a finite value in (0, {MAX_PLEDGE_MB}]")
-                    coord.registry.register(
-                        data["node_id"], data["host"], data["port"],
-                        data["operator"], pledge,
-                    )
+                        raise ValueError(f"pledge_mb must be finite in (0, {MAX_PLEDGE_MB}]")
+                    coord.registry.register(data["node_id"], data["host"], data["port"],
+                                            data["operator"], pledge)
                     coord.current_tier()  # re-evaluate the ladder on join
                     self._json(200, {"ok": True})
                 elif self.path == "/heartbeat":
@@ -478,16 +453,17 @@ def make_handler(coord: Coordinator):
                     coord.current_tier()  # re-evaluate the ladder on leave
                     self._json(200, {"ok": ok})
                 elif self.path == "/ask":
-                    raw_tokens = data.get("max_tokens", 48)
-                    if isinstance(raw_tokens, float) and not math.isfinite(raw_tokens):
-                        raise ValueError("max_tokens must be finite")
-                    max_tokens = max(1, min(int(raw_tokens), MAX_TOKENS_CAP))
-                    result = coord.submit(data.get("user", "anon"), data["prompt"], max_tokens)
-                    self._json(200, result)
+                    user, prompt, max_tokens = self._parse_ask(data)
+                    self._json(200, coord.submit(user, prompt, max_tokens))
+                elif self.path == "/ask/stream":
+                    self._stream_ask(data)
                 else:
                     self._json(404, {"error": "unknown path"})
             except Exception as exc:
-                self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+                try:
+                    self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+                except Exception:
+                    pass
 
     return Handler
 
@@ -496,23 +472,31 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Sanad coordinator")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--bind", default="127.0.0.1",
-                    help="bind address (default loopback; anything else is at your own risk in v0)")
+                    help="bind address; use 0.0.0.0 to accept nodes and clients "
+                         "from your local network (v0 has no authentication)")
     ap.add_argument("--models", required=True,
                     help="comma-separated GGUF paths, the capacity-ladder catalog")
-    ap.add_argument("--llama-bin", required=True, help="directory containing llama-completion.exe")
+    ap.add_argument("--llama-bin", required=True, help="directory containing llama-server")
+    ap.add_argument("--engine-port", type=int, default=7970)
     args = ap.parse_args()
 
     catalog = load_catalog(args.models.split(","))
-    runner = InferenceRunner(Path(args.llama_bin).resolve())
-    coord = Coordinator(runner, catalog)
+    engines = EngineManager(Path(args.llama_bin).resolve(), port=args.engine_port)
+    coord = Coordinator(engines, catalog)
     if args.bind != "127.0.0.1":
-        print("[sanad-coordinator] WARNING: binding beyond loopback — v0 has no "
-              "authentication and llama.cpp's RPC backend is not hardened. "
-              "Trusted networks only.")
+        print("[sanad-coordinator] NOTE: binding beyond loopback. v0 has no "
+              "authentication and llama.cpp's RPC backend is not hardened — "
+              "trusted networks only.")
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(coord))
     tiers = " -> ".join(f"{t.name} (needs {t.need_mb:.0f} MB)" for t in catalog)
-    print(f"[sanad-coordinator] http://{args.bind}:{args.port}  ladder: {tiers}")
-    server.serve_forever()
+    print(f"[sanad-coordinator] http://{args.bind}:{args.port}  (open it in a browser to chat)")
+    print(f"[sanad-coordinator] ladder: {tiers}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        engines.stop()
 
 
 if __name__ == "__main__":

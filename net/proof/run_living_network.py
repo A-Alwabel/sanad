@@ -99,7 +99,7 @@ def main() -> None:
 
     try:
         section("1. Coordinator up with a 2-tier catalog; dedicated node A joins (pledge 1000 MB)")
-        spawn(["sanad_net.coordinator", "--port", "7862", "--models", models, "--llama-bin", llama_bin])
+        spawn(["sanad_net.coordinator", "--port", "7862", "--models", models, "--llama-bin", llama_bin, "--engine-port", "7972"])
         time.sleep(1.5)
         spawn(["sanad_net.node", "--node-id", "riyadh-a", "--operator", "amina",
                "--port", "50090", "--pledge-mb", "1000", "--busy-at", "101",
@@ -115,8 +115,12 @@ def main() -> None:
         assert r["model"] == SMALL
 
         section("3. LADDER UP: polite node B joins (pledge 700 MB) -> pool fits the LARGE model")
+        # busy-at 85: on this single-machine proof the resident engine's own
+        # load counts as "other process" from the node's point of view, so the
+        # threshold must sit above ordinary inference and below a saturated
+        # machine. On separate machines the engine is not a neighbour at all.
         spawn(["sanad_net.node", "--node-id", "jeddah-b", "--operator", "bilal",
-               "--port", "50091", "--pledge-mb", "700", "--busy-at", "45", "--resume-at", "30",
+               "--port", "50091", "--pledge-mb", "700", "--busy-at", "85", "--resume-at", "45",
                "--coordinator", COORD, "--rpc-bin", llama_bin])
         wait_for(lambda: call("/status")["model"] == LARGE, 60, "ladder upgrade to large model")
         r = call("/ask", {"user": "anon", "prompt": "A mining pool is", "max_tokens": 24})
@@ -171,7 +175,8 @@ def main() -> None:
         stop_hog(hogs)
         for p in procs:
             p.terminate()
-        subprocess.run(["taskkill", "/F", "/IM", "ggml-rpc-server.exe"], capture_output=True)
+        for image in ("ggml-rpc-server.exe", "llama-server.exe"):
+            subprocess.run(["taskkill", "/F", "/IM", image], capture_output=True)
 
 
 if __name__ == "__main__":

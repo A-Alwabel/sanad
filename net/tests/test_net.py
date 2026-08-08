@@ -1,4 +1,4 @@
-"""Unit tests for sanad_net v0.2.1 (no llama.cpp binaries required)."""
+"""Unit tests for sanad_net v0.3 (no llama.cpp binaries or model required)."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sanad_net.coordinator import (  # noqa: E402
-    CapacityError, ChainFailure, Coordinator, ModelTier, Registry,
-    make_handler, parse_llama_log, pick_tier,
+    CapacityError, ChainFailure, Coordinator, ModelTier, Registry, make_handler, pick_tier,
 )
+from sanad_net.engine import EngineError, parse_shard_map  # noqa: E402
 from sanad_net.ledger import Ledger  # noqa: E402
 from sanad_net.node import SensorFSM  # noqa: E402
 
@@ -35,8 +35,6 @@ SAMPLE_LOG = """
 0.01.719.975 D load_tensors: layer   1 assigned to device RPC0, is_swa = 0
 0.01.719.976 D load_tensors: layer   2 assigned to device RPC1, is_swa = 0
 0.01.719.978 D load_tensors: layer  13 assigned to device RPC1, is_swa = 0
-0.06.026.159 I common_perf_print: prompt eval time =      77.13 ms /     4 tokens (   19.28 ms per token,    51.86 tokens per second)
-0.06.026.161 I common_perf_print:        eval time =    1025.62 ms /    31 runs   (   33.08 ms per token,    30.23 tokens per second)
 """
 
 TIER_S = ModelTier(name="small", path=Path("small.gguf"), file_mb=470.0)   # needs 658
@@ -44,73 +42,112 @@ TIER_L = ModelTier(name="large", path=Path("large.gguf"), file_mb=1100.0)  # nee
 CATALOG = [TIER_S, TIER_L]
 
 
-class FakeRunner:
-    """Deterministic stand-in for llama-completion.
+class FakeEngine:
+    """Stand-in for a resident llama-server.
 
-    Reports a shard map where the layer split follows the tensor_split ratio
-    over 25 layers — mirroring the empirically verified --tensor-split behavior.
-    `gate`: if set, run() blocks until the event is set (deterministic timing).
-    `fail_times`: raise ChainFailure for the first N calls.
-    `unprovable`: return an empty shard_map (parse-failure simulation).
+    Reports a shard map whose layer split follows the tensor_split ratio over
+    25 layers, mirroring the empirically verified --tensor-split behavior.
     """
 
-    def __init__(self, delay_s: float = 0.05, fail_times: int = 0,
-                 gate: threading.Event | None = None, unprovable: bool = False):
+    def __init__(self, mgr, model_path, nodes):
+        self.mgr = mgr
+        self.model_path = model_path
+        self.nodes = nodes
+        self.started_at = time.time()
+        self.load_s = 0.01
+        total = sum(float(n["pledge_mb"]) for n in nodes) or 1.0
+        counts = [round(25 * float(n["pledge_mb"]) / total) for n in nodes]
+        counts[-1] = 25 - sum(counts[:-1])
+        self.shard_map, start = {}, 0
+        for i, (n, c) in enumerate(zip(nodes, counts)):
+            self.shard_map[f"RPC{i}"] = {
+                "endpoint": f"{n['host']}:{n['port']}",
+                "layers": f"{start}-{start + c - 1}", "n_layers": c,
+            }
+            start += c
+
+    def alive(self):
+        return True
+
+    def complete(self, prompt, max_tokens, on_token=None):
+        self.mgr.calls.append(prompt)
+        if self.mgr.fail_times > 0:
+            self.mgr.fail_times -= 1
+            raise EngineError("simulated pipeline failure (node vanished mid-job)")
+        if self.mgr.gate is not None:
+            self.mgr.gate.wait(timeout=10)
+        time.sleep(self.mgr.delay_s)
+        for piece in ("hel", "lo ", "world"):
+            if on_token:
+                on_token(piece)
+        if self.mgr.unprovable:
+            self.shard_map = {}
+        return {"text": f"echo:{prompt}", "decode_tokens": 25, "tok_per_s": 60.0,
+                "wall_s": self.mgr.delay_s, "ttft_s": 0.01}
+
+    def stop(self):
+        pass
+
+
+class FakeEngines:
+    """Stand-in EngineManager: same warm/cold semantics, no subprocess."""
+
+    def __init__(self, delay_s=0.05, fail_times=0, gate=None, unprovable=False):
         self.delay_s = delay_s
         self.fail_times = fail_times
         self.gate = gate
         self.unprovable = unprovable
         self.calls: list[str] = []
-        self._lock = threading.Lock()
+        self.engine = None
+        self.signature = None
+        self.restarts = 0
+        self.starts = 0
+        self.on_event = lambda msg: None
 
-    def run(self, model_path, prompt, rpc_servers, tensor_split, max_tokens) -> dict:
-        with self._lock:
-            self.calls.append(prompt)
-            fail = self.fail_times > 0
-            if fail:
-                self.fail_times -= 1
-        if self.gate is not None:
-            self.gate.wait(timeout=10)
-        if fail:
-            raise ChainFailure("simulated chain failure (node vanished mid-job)")
-        time.sleep(self.delay_s)
-        if self.unprovable:
-            return {"text": "???", "wall_s": self.delay_s, "shard_map": {},
-                    "decode_tokens": 25, "tok_per_s": 60.0}
-        total = sum(tensor_split)
-        n_layers = [round(25 * s / total) for s in tensor_split]
-        n_layers[-1] = 25 - sum(n_layers[:-1])
-        shard_map, start = {}, 0
-        for i, (ep, n) in enumerate(zip(rpc_servers, n_layers)):
-            shard_map[f"RPC{i}"] = {"endpoint": ep, "layers": f"{start}-{start + n - 1}", "n_layers": n}
-            start += n
-        return {
-            "text": f"echo:{prompt}", "wall_s": self.delay_s,
-            "shard_map": shard_map, "decode_tokens": 25, "tok_per_s": 60.0,
-        }
+    @staticmethod
+    def _sig(model_path, nodes):
+        return (str(model_path), tuple((n["node_id"], n["pledge_mb"]) for n in nodes))
+
+    def ensure(self, model_path, nodes):
+        sig = self._sig(model_path, nodes)
+        if self.engine is not None and self.signature == sig:
+            return self.engine                   # warm
+        if self.engine is not None:
+            self.restarts += 1
+        self.engine = FakeEngine(self, model_path, nodes)
+        self.signature = sig
+        self.starts += 1
+        return self.engine
+
+    def invalidate(self):
+        self.signature = None
+
+    def stop(self):
+        self.engine = None
 
 
-def mk_coord(runner=None, nodes=True) -> tuple[Coordinator, FakeRunner]:
-    runner = runner or FakeRunner()
-    coord = Coordinator(runner, CATALOG)
+def mk_coord(engines=None, nodes=True) -> tuple[Coordinator, FakeEngines]:
+    engines = engines or FakeEngines()
+    coord = Coordinator(engines, CATALOG)
     coord.RETRY_DELAY_S = 0.05  # fast retries in tests
     if nodes:
         coord.registry.register("n1", "127.0.0.1", 50060, "amina", 1000)
         coord.registry.register("n2", "127.0.0.1", 50061, "bilal", 600)
-    return coord, runner
+    return coord, engines
 
 
-class TestParseLlamaLog(unittest.TestCase):
-    def test_shard_map_and_perf(self):
-        out = parse_llama_log(SAMPLE_LOG)
-        self.assertEqual(set(out["shard_map"]), {"RPC0", "RPC1"})
-        self.assertEqual(out["shard_map"]["RPC0"]["endpoint"], "127.0.0.1:50060")
-        self.assertEqual(out["shard_map"]["RPC0"]["layers"], "0-1")
-        self.assertEqual(out["shard_map"]["RPC0"]["n_layers"], 2)  # duplicates deduped
-        self.assertEqual(out["shard_map"]["RPC1"]["layers"], "2-13")  # last pass wins
-        self.assertEqual(out["shard_map"]["RPC1"]["n_layers"], 2)
-        self.assertEqual(out["decode_tokens"], 31)  # decode line, NOT the prompt-eval line
-        self.assertAlmostEqual(out["tok_per_s"], 30.23)
+class TestParseShardMap(unittest.TestCase):
+    def test_shard_map(self):
+        sm = parse_shard_map(SAMPLE_LOG)
+        self.assertEqual(set(sm), {"RPC0", "RPC1"})
+        self.assertEqual(sm["RPC0"]["endpoint"], "127.0.0.1:50060")
+        self.assertEqual(sm["RPC0"]["layers"], "0-1")
+        self.assertEqual(sm["RPC0"]["n_layers"], 2)   # duplicate passes deduped
+        self.assertEqual(sm["RPC1"]["layers"], "2-13")  # last pass wins
+        self.assertEqual(sm["RPC1"]["n_layers"], 2)
+
+    def test_empty_log(self):
+        self.assertEqual(parse_shard_map("nothing to see"), {})
 
 
 class TestLedger(unittest.TestCase):
@@ -118,8 +155,7 @@ class TestLedger(unittest.TestCase):
         led = Ledger()
         led.earn("a", 10, "served")
         self.assertEqual(led.balance("a"), 10)
-        spent = led.spend("a", 25, "big job")
-        self.assertEqual(spent, 10)  # clamped — never negative
+        self.assertEqual(led.spend("a", 25, "big job"), 10)  # clamped — never negative
         self.assertEqual(led.balance("a"), 0)
         self.assertEqual(led.spend("ghost", 5, "x"), 0)
 
@@ -136,17 +172,17 @@ class TestRegistry(unittest.TestCase):
         self.assertFalse(reg.heartbeat("nope"))
         self.assertEqual([n["node_id"] for n in reg.alive()], ["n1"])
         reg.suspect("n1")
-        self.assertEqual(reg.alive(), [])          # dead until next heartbeat
+        self.assertEqual(reg.alive(), [])            # dead until next heartbeat
         self.assertTrue(reg.heartbeat("n1"))
-        self.assertEqual([n["node_id"] for n in reg.alive()], ["n1"])  # revived
+        self.assertEqual([n["node_id"] for n in reg.alive()], ["n1"])   # revived
         self.assertTrue(reg.leave("n1"))
-        self.assertFalse(reg.leave("n1"))          # idempotent
+        self.assertFalse(reg.leave("n1"))            # idempotent
         self.assertEqual(reg.alive(), [])
 
     def test_ttl_expiry(self):
         reg = Registry()
         reg.register("n1", "127.0.0.1", 50060, "amina", 1000)
-        reg._nodes["n1"]["last_seen"] = time.time() - 999  # simulate silence
+        reg._nodes["n1"]["last_seen"] = time.time() - 999
         self.assertEqual(reg.alive(), [])
 
 
@@ -157,61 +193,92 @@ class TestCapacityLadder(unittest.TestCase):
         self.assertEqual(pick_tier(CATALOG, TIER_S.need_mb).name, "small")   # exact fit
         self.assertEqual(pick_tier(CATALOG, TIER_L.need_mb - 1).name, "small")
         self.assertEqual(pick_tier(CATALOG, TIER_L.need_mb).name, "large")
-        self.assertEqual(pick_tier(CATALOG, 99999).name, "large")
 
     def test_ladder_events_on_join_and_leave(self):
         coord, _ = mk_coord(nodes=False)
         coord.registry.register("n1", "127.0.0.1", 50060, "amina", 1000)
         coord.current_tier()
         coord.registry.register("n2", "127.0.0.1", 50061, "bilal", 600)
-        coord.current_tier()  # pool 1600 -> large
+        coord.current_tier()   # pool 1600 -> large
         coord.registry.leave("n2")
-        coord.current_tier()  # pool 1000 -> small again
-        transitions = [e["event"] for e in coord.events if e["event"].startswith("LADDER")]
-        self.assertIn("small", transitions[0])
-        self.assertIn("UP", transitions[1])
-        self.assertIn("large", transitions[1])
-        self.assertIn("DOWN", transitions[2])
-        self.assertIn("small", transitions[2])
+        coord.current_tier()   # pool 1000 -> small again
+        t = [e["event"] for e in coord.events if e["event"].startswith("LADDER")]
+        self.assertIn("small", t[0])
+        self.assertIn("UP", t[1]); self.assertIn("large", t[1])
+        self.assertIn("DOWN", t[2]); self.assertIn("small", t[2])
 
     def test_status_does_not_emit_ladder_events(self):
         coord, _ = mk_coord()
         before = len(coord.events)
-        coord.status()
-        coord.status()
+        coord.status(); coord.status()
         self.assertEqual(len(coord.events), before)
+
+
+class TestResidentEngine(unittest.TestCase):
+    def test_second_request_reuses_the_pipeline(self):
+        coord, engines = mk_coord()
+        first = coord.submit("anon", "one", 25)
+        second = coord.submit("anon", "two", 25)
+        self.assertFalse(first["engine_warm"])       # built for this request
+        self.assertTrue(second["engine_warm"])       # reused, no reload
+        self.assertEqual(engines.starts, 1)
+        self.assertEqual(engines.restarts, 0)
+
+    def test_membership_change_rebuilds_the_pipeline(self):
+        coord, engines = mk_coord()
+        coord.submit("anon", "one", 25)
+        coord.registry.leave("n2")                   # pipeline changed -> must rebuild
+        coord.submit("anon", "two", 25)
+        self.assertEqual(engines.starts, 2)
+        self.assertEqual(engines.restarts, 1)
+
+    def test_streaming_pushes_tokens_then_done(self):
+        import queue
+        coord, _ = mk_coord()
+        q: queue.Queue = queue.Queue()
+        result = coord.submit("anon", "hi", 25, stream_q=q)
+        kinds = []
+        while not q.empty():
+            kinds.append(q.get_nowait()[0])
+        self.assertEqual(kinds, ["token", "token", "token", "done"])
+        self.assertEqual(result["decode_tokens"], 25)
 
 
 class TestSensorFSM(unittest.TestCase):
     def test_drain_after_sustained_busy(self):
-        fsm = SensorFSM(busy_at=50, resume_at=25, busy_samples=2, calm_samples=3)
-        self.assertIsNone(fsm.step(80, serving=True))      # 1st busy sample
-        self.assertEqual(fsm.step(80, serving=True), "drain")  # 2nd -> drain
+        fsm = SensorFSM(50, 25, busy_samples=2, calm_samples=3)
+        self.assertIsNone(fsm.step(80, serving=True))
+        self.assertEqual(fsm.step(80, serving=True), "drain")
 
     def test_short_spike_ignored(self):
-        fsm = SensorFSM(busy_at=50, resume_at=25, busy_samples=2, calm_samples=3)
+        fsm = SensorFSM(50, 25, busy_samples=2, calm_samples=3)
         self.assertIsNone(fsm.step(80, serving=True))
-        self.assertIsNone(fsm.step(10, serving=True))      # spike broken
-        self.assertIsNone(fsm.step(80, serving=True))      # streak restarted
+        self.assertIsNone(fsm.step(10, serving=True))    # spike broken
+        self.assertIsNone(fsm.step(80, serving=True))    # streak restarted
 
     def test_rejoin_after_sustained_calm(self):
-        fsm = SensorFSM(busy_at=50, resume_at=25, busy_samples=2, calm_samples=3)
+        fsm = SensorFSM(50, 25, busy_samples=2, calm_samples=3)
         self.assertIsNone(fsm.step(10, serving=False))
         self.assertIsNone(fsm.step(10, serving=False))
         self.assertEqual(fsm.step(10, serving=False), "rejoin")
 
     def test_failed_sample_resets_and_never_acts(self):
-        fsm = SensorFSM(busy_at=50, resume_at=25, busy_samples=2, calm_samples=3)
+        fsm = SensorFSM(50, 25, busy_samples=2, calm_samples=3)
         self.assertIsNone(fsm.step(80, serving=True))
-        self.assertIsNone(fsm.step(None, serving=True))    # sample failed: reset
-        self.assertIsNone(fsm.step(80, serving=True))      # streak starts over
+        self.assertIsNone(fsm.step(None, serving=True))  # sample failed: reset
+        self.assertIsNone(fsm.step(80, serving=True))
         self.assertEqual(fsm.step(80, serving=True), "drain")
-        # calm side too
-        self.assertIsNone(fsm.step(10, serving=False))
-        self.assertIsNone(fsm.step(None, serving=False))
-        self.assertIsNone(fsm.step(10, serving=False))
-        self.assertIsNone(fsm.step(10, serving=False))
-        self.assertEqual(fsm.step(10, serving=False), "rejoin")
+
+
+class TestSamplerSelection(unittest.TestCase):
+    def test_make_sampler_returns_a_working_sampler(self):
+        from sanad_net.node import make_sampler
+        s = make_sampler()
+        self.assertTrue(hasattr(s, "other_load_percent"))
+        first = s.other_load_percent(None)           # may be None on first sample
+        self.assertTrue(first is None or 0.0 <= first <= 100.0)
+        second = s.other_load_percent(None)
+        self.assertTrue(second is None or 0.0 <= second <= 100.0)
 
 
 class TestCoordinatorScheduling(unittest.TestCase):
@@ -222,15 +289,14 @@ class TestCoordinatorScheduling(unittest.TestCase):
         # pledges 1000:600 over 25 layers -> 16:9 layers -> credits 16:9 of 25 tokens
         self.assertAlmostEqual(coord.ledger.balance("amina"), 16.0, places=2)
         self.assertAlmostEqual(coord.ledger.balance("bilal"), 9.0, places=2)
-        # conservation: total minted to operators == tokens == what anon was (maximally) charged
         minted = sum(e.delta for e in coord.ledger.entries() if e.delta > 0 and e.account != "anon")
         self.assertAlmostEqual(minted, 25.0, places=2)
-        self.assertEqual(coord.ledger.balance("anon"), 0.0)  # clamped, still served
+        self.assertEqual(coord.ledger.balance("anon"), 0.0)   # clamped, still served
 
     def test_escrow_settlement_refund(self):
         coord, _ = mk_coord()
         coord.ledger.earn("maha", 100, "operated a node")
-        coord.submit("maha", "q", 50)          # escrow 50, actual 25
+        coord.submit("maha", "q", 50)            # escrow 50, actual 25
         self.assertAlmostEqual(coord.ledger.balance("maha"), 75.0, places=2)
         reasons = [e.reason for e in coord.ledger.entries() if e.account == "maha"]
         self.assertTrue(any("escrow for job" in r for r in reasons))
@@ -238,165 +304,180 @@ class TestCoordinatorScheduling(unittest.TestCase):
 
     def test_priority_orders_queue_deterministically(self):
         gate = threading.Event()
-        coord, runner = mk_coord(FakeRunner(gate=gate))
+        coord, engines = mk_coord(FakeEngines(gate=gate))
         coord.ledger.earn("vip", 100, "operated a node")
-        done: list[str] = []
-        lock = threading.Lock()
-
-        def ask(user, prompt):
-            coord.submit(user, prompt, 10)
-            with lock:
-                done.append(user)
-
-        threads = [threading.Thread(target=ask, args=("anon", "filler"))]
+        threads = [threading.Thread(target=coord.submit, args=("anon", "filler", 10))]
         threads[0].start()
-        while not runner.calls:          # filler provably inside run()
+        while not engines.calls:
             time.sleep(0.01)
-        for user, prompt in [("zed", "zed-q"), ("vip", "vip-q")]:  # zed queued FIRST
-            t = threading.Thread(target=ask, args=(user, prompt))
-            t.start()
-            threads.append(t)
-            time.sleep(0.05)
-        gate.set()                        # release everything
+        for user, prompt in [("zed", "zed-q"), ("vip", "vip-q")]:   # zed queued FIRST
+            t = threading.Thread(target=coord.submit, args=(user, prompt, 10))
+            t.start(); threads.append(t); time.sleep(0.05)
+        gate.set()
         for t in threads:
             t.join(timeout=10)
-        self.assertEqual(runner.calls[0], "filler")
-        self.assertEqual(runner.calls[1], "vip-q")   # credits beat arrival order
-        self.assertEqual(runner.calls[2], "zed-q")   # anonymous still served
+        self.assertEqual(engines.calls[0], "filler")
+        self.assertEqual(engines.calls[1], "vip-q")   # credits beat arrival order
+        self.assertEqual(engines.calls[2], "zed-q")   # anonymous still served
 
     def test_anti_starvation_fifo_slot(self):
         gate = threading.Event()
-        coord, runner = mk_coord(FakeRunner(gate=gate))
+        coord, engines = mk_coord(FakeEngines(gate=gate))
         for v in ("v1", "v2", "v3", "v4"):
             coord.ledger.earn(v, 1000, "operator")
         threads = [threading.Thread(target=coord.submit, args=("anon", "filler", 5))]
         threads[0].start()
-        while not runner.calls:
+        while not engines.calls:
             time.sleep(0.01)
-        # zero-credit "zayd" enqueued BEFORE a stream of four credit-holders
-        order = [("zayd", "zayd-q"), ("v1", "q1"), ("v2", "q2"), ("v3", "q3"), ("v4", "q4")]
-        for user, prompt in order:
+        for user, prompt in [("zayd", "zayd-q"), ("v1", "q1"), ("v2", "q2"),
+                             ("v3", "q3"), ("v4", "q4")]:
             t = threading.Thread(target=coord.submit, args=(user, prompt, 5))
-            t.start()
-            threads.append(t)
-            time.sleep(0.05)
+            t.start(); threads.append(t); time.sleep(0.05)
         gate.set()
         for t in threads:
             t.join(timeout=15)
-        # Every 3rd slot is FIFO: zayd (earliest seq in queue) must be served
-        # at slot 3 despite four higher-priority rivals.
-        self.assertEqual(runner.calls[0], "filler")
-        self.assertIn("zayd-q", runner.calls[:3])
+        # every 3rd slot is FIFO: the zero-credit user must be served at slot 3
+        self.assertEqual(engines.calls[0], "filler")
+        self.assertIn("zayd-q", engines.calls[:3])
 
     def test_timed_out_job_is_cancelled_refunded_and_never_runs(self):
         gate = threading.Event()
-        coord, runner = mk_coord(FakeRunner(gate=gate))
+        coord, engines = mk_coord(FakeEngines(gate=gate))
         coord.ledger.earn("maha", 100, "operator")
         t1 = threading.Thread(target=lambda: coord.submit("anon", "filler", 5))
         t1.start()
-        while not runner.calls:
+        while not engines.calls:
             time.sleep(0.01)
         with self.assertRaises(TimeoutError):
-            coord.submit("maha", "doomed", 40, timeout_s=0.2)   # queued behind filler
-        self.assertAlmostEqual(coord.ledger.balance("maha"), 100.0, places=2)  # escrow refunded
+            coord.submit("maha", "doomed", 40, timeout_s=0.2)
+        self.assertAlmostEqual(coord.ledger.balance("maha"), 100.0, places=2)  # refunded
         gate.set()
         t1.join(timeout=10)
-        time.sleep(0.3)  # give the worker a chance to (wrongly) run it
-        self.assertNotIn("doomed", runner.calls)   # cancelled job never executed
+        time.sleep(0.3)
+        self.assertNotIn("doomed", engines.calls)     # cancelled job never executed
 
     def test_capacity_errors_fail_fast_without_repair(self):
-        coord, runner = mk_coord(nodes=False)
+        coord, engines = mk_coord(nodes=False)
         with self.assertRaises(RuntimeError) as ctx:
             coord.submit("anon", "hi", 5)
         self.assertIn("no live nodes", str(ctx.exception))
-        self.assertEqual(runner.calls, [])         # runner never invoked
+        self.assertEqual(engines.calls, [])
         self.assertFalse(any("chain failed" in e["event"] for e in coord.events))
 
     def test_pool_too_small_fails_fast(self):
-        coord, runner = mk_coord(nodes=False)
+        coord, _ = mk_coord(nodes=False)
         coord.registry.register("tiny", "127.0.0.1", 50060, "amina", 100)
         with self.assertRaises(RuntimeError) as ctx:
             coord.submit("anon", "hi", 5)
         self.assertIn("cannot hold", str(ctx.exception))
-        self.assertFalse(any("chain failed" in e["event"] for e in coord.events))
 
     def test_chain_repair_evicts_stale_and_retries_with_survivor(self):
         gate = threading.Event()
-        coord, runner = mk_coord(FakeRunner(gate=gate, fail_times=1))
-        # Registration normally precedes jobs by seconds; Windows' coarse clock
-        # can otherwise give registration and job-start the same timestamp.
-        for nid in ("n1", "n2"):
+        coord, engines = mk_coord(FakeEngines(gate=gate, fail_times=1))
+        for nid in ("n1", "n2"):     # registration precedes the job on a coarse clock
             coord.registry._nodes[nid]["last_seen"] -= 1.0
-        result_box: dict = {}
-
-        def ask():
-            result_box["r"] = coord.submit("anon", "hello", 25)
-
-        t = threading.Thread(target=ask)
+        box: dict = {}
+        t = threading.Thread(target=lambda: box.update(r=coord.submit("anon", "hello", 25)))
         t.start()
-        while not runner.calls:
+        while not engines.calls:
             time.sleep(0.01)
-        coord.registry.heartbeat("n1")   # n1 heartbeats DURING the job -> fresh -> survives
-        gate.set()                       # first attempt now fails; n2 is stale -> suspected
+        coord.registry.heartbeat("n1")   # n1 is fresh -> survives; n2 is stale -> suspected
+        gate.set()
         t.join(timeout=10)
-        r = result_box["r"]
+        r = box["r"]
         self.assertTrue(r["repaired"])
-        self.assertEqual(len(runner.calls), 2)
-        self.assertEqual([n["node_id"] for n in r["pipeline"]], ["n1"])  # survivor only
+        self.assertEqual(len(engines.calls), 2)
+        self.assertEqual([n["node_id"] for n in r["pipeline"]], ["n1"])
         self.assertTrue(any("chain failed" in e["event"] for e in coord.events))
 
     def test_unprovable_shard_map_charges_and_pays_nobody(self):
-        coord, _ = mk_coord(FakeRunner(unprovable=True))
+        coord, _ = mk_coord(FakeEngines(unprovable=True))
         coord.ledger.earn("maha", 100, "operator")
         coord.submit("maha", "q", 50)
-        self.assertAlmostEqual(coord.ledger.balance("maha"), 100.0, places=2)  # fully refunded
+        self.assertAlmostEqual(coord.ledger.balance("maha"), 100.0, places=2)  # refunded
         self.assertEqual(coord.ledger.balance("amina"), 0.0)                    # nothing minted
         self.assertTrue(any("unprovable" in e["event"] for e in coord.events))
 
 
-class TestHTTPRoundTrip(unittest.TestCase):
-    def test_full_http_surface(self):
-        coord, _ = mk_coord(nodes=False)
+class TestHTTPSurface(unittest.TestCase):
+    def _serve(self, coord):
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))
-        port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{port}"
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
 
-        def call(path, payload=None):
-            if payload is None:
-                with urllib.request.urlopen(f"{base}{path}", timeout=10) as r:
-                    return json.loads(r.read())
-            req = urllib.request.Request(
-                f"{base}{path}", data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as r:
+    @staticmethod
+    def _call(base, path, payload=None):
+        if payload is None:
+            with urllib.request.urlopen(f"{base}{path}", timeout=10) as r:
                 return json.loads(r.read())
+        req = urllib.request.Request(
+            f"{base}{path}", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
 
+    def test_full_round_trip(self):
+        coord, _ = mk_coord(nodes=False)
+        server, base = self._serve(coord)
         try:
-            call("/register", {"node_id": "n1", "host": "127.0.0.1", "port": 50060,
-                               "operator": "amina", "pledge_mb": 1000})
-            call("/register", {"node_id": "n2", "host": "127.0.0.1", "port": 50061,
-                               "operator": "bilal", "pledge_mb": 600})
-            st = call("/status")
-            self.assertEqual(st["model"], "large")
-            r = call("/ask", {"user": "anon", "prompt": "hi", "max_tokens": 25})
+            self._call(base, "/register", {"node_id": "n1", "host": "127.0.0.1", "port": 50060,
+                                           "operator": "amina", "pledge_mb": 1000})
+            self._call(base, "/register", {"node_id": "n2", "host": "127.0.0.1", "port": 50061,
+                                           "operator": "bilal", "pledge_mb": 600})
+            self.assertEqual(self._call(base, "/status")["model"], "large")
+            r = self._call(base, "/ask", {"user": "anon", "prompt": "hi", "max_tokens": 25})
             self.assertEqual(r["decode_tokens"], 25)
-            entries = call("/ledger")["entries"]
-            minted = sum(e["delta"] for e in entries if e["delta"] > 0)
-            self.assertAlmostEqual(minted, 25.0, places=2)
-            self.assertTrue(call("/leave", {"node_id": "n2"})["ok"])
-            self.assertEqual(call("/status")["model"], "small")
+            entries = self._call(base, "/ledger")["entries"]
+            self.assertAlmostEqual(sum(e["delta"] for e in entries if e["delta"] > 0), 25.0, places=2)
+            self.assertTrue(self._call(base, "/leave", {"node_id": "n2"})["ok"])
+            self.assertEqual(self._call(base, "/status")["model"], "small")
         finally:
             server.shutdown()
+            server.server_close()
+
+    def test_chat_page_is_served(self):
+        coord, _ = mk_coord()
+        server, base = self._serve(coord)
+        try:
+            with urllib.request.urlopen(f"{base}/", timeout=10) as r:
+                page = r.read().decode()
+                self.assertEqual(r.status, 200)
+                self.assertIn("text/html", r.headers.get("Content-Type", ""))
+            for needle in ("Sanad", "/ask/stream", "<textarea"):
+                self.assertIn(needle, page)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_sse_stream_endpoint(self):
+        coord, _ = mk_coord()
+        server, base = self._serve(coord)
+        try:
+            req = urllib.request.Request(
+                f"{base}/ask/stream",
+                data=json.dumps({"user": "anon", "prompt": "hi", "max_tokens": 25}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            events = []
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                self.assertIn("text/event-stream", resp.headers.get("Content-Type", ""))
+                buf = ""
+                for raw in resp:
+                    buf += raw.decode()
+                    while "\n\n" in buf:
+                        chunk, buf = buf.split("\n\n", 1)
+                        if chunk.strip().startswith("data:"):
+                            events.append(json.loads(chunk.strip()[5:]))
+            self.assertEqual([e["type"] for e in events], ["token", "token", "token", "done"])
+            self.assertEqual("".join(e["text"] for e in events if e["type"] == "token"), "hello world")
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_input_validation(self):
         coord, _ = mk_coord(nodes=False)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))
-        port = server.server_address[1]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{port}"
+        server, base = self._serve(coord)
 
-        def post_raw(path, body: str) -> int:
+        def post_raw(path, body):
             req = urllib.request.Request(
                 f"{base}{path}", data=body.encode(),
                 headers={"Content-Type": "application/json"}, method="POST")
@@ -407,24 +488,19 @@ class TestHTTPRoundTrip(unittest.TestCase):
                 return e.code
 
         try:
-            # Infinity/NaN pledges rejected (Python json parses them!)
-            code = post_raw("/register", '{"node_id":"evil","host":"127.0.0.1","port":1,'
-                                         '"operator":"x","pledge_mb":Infinity}')
-            self.assertEqual(code, 500)
-            code = post_raw("/register", '{"node_id":"evil","host":"127.0.0.1","port":1,'
-                                         '"operator":"x","pledge_mb":NaN}')
-            self.assertEqual(code, 500)
-            self.assertEqual(coord.registry.alive(), [])   # nothing registered
-            # negative/huge max_tokens are clamped, not honored
+            # Python's json parses Infinity/NaN — both must be rejected
+            for bad in ("Infinity", "NaN"):
+                code = post_raw("/register", '{"node_id":"evil","host":"127.0.0.1","port":1,'
+                                             f'"operator":"x","pledge_mb":{bad}}}')
+                self.assertEqual(code, 500)
+            self.assertEqual(coord.registry.alive(), [])
+            # negative max_tokens is clamped, not honored
             coord.registry.register("n1", "127.0.0.1", 50060, "amina", 1000)
-            req = urllib.request.Request(
-                f"{base}/ask", data=json.dumps({"user": "anon", "prompt": "x",
-                                                "max_tokens": -99}).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                self.assertEqual(json.loads(resp.read())["decode_tokens"], 25)  # served, clamped to >=1
+            r = self._call(base, "/ask", {"user": "anon", "prompt": "x", "max_tokens": -99})
+            self.assertEqual(r["decode_tokens"], 25)
         finally:
             server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

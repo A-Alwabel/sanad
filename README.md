@@ -4,7 +4,7 @@
 
 **Sanad** (Arabic: *سند*, "support" — and the classical term for the **chain of transmission** that carries knowledge from person to person, each link vouching for the next) is a community inference network for large open-weight language models. Nodes each hold a *slice* of a model's layers; chained together, they serve models none of them could run alone. Contributing compute earns **non-tradeable credits** that give you priority when you use the network.
 
-**Status: proven across separate networks (v0.5).** Five proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
+**Status: use it for anything (v0.7).** Six proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
 
 - **First Light** — a real model's layers physically split across two node processes over TCP, real text generated through the chain, credits earned by serving and spent as priority.
 - **The Living Network** — the network *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself → rejoined by itself when the machine calmed); and credits are **weighted by layer share**. Your device, your priority, always.
@@ -12,6 +12,8 @@
 - **Usable Together** — joining takes **one command and no address** (`--discover` finds the coordinator by broadcast); the network **holds a conversation** (full history through the model's own chat template); credits are **written to an append-only ledger** that survived the coordinator being killed mid-flight (verified by replaying the file with the coordinator dead); and several people are **served at once** (3x the throughput of one-at-a-time).
 
 - **Two Networks** — each node now runs in its own Linux container on its own network, unable to even resolve the other; only the coordinator bridges them. A 1.5B model shards across the two (layers 0–17 / 18–28) and answers correctly. And the honest number: adding 40 ms of latency per link drops throughput from **31.3 to 4.2 tok/s (7.5x slower)** — splitting a model across a network means every token crosses every hop. Sanad is for models too big for one device, not for speed.
+
+- **For Everything** — the coordinator speaks the **OpenAI-compatible API**, so any agent, editor, or script points at it and works with no changes. Verified by driving Sanad with the official OpenAI client, which has never heard of this project. No subscription, no key, no permission.
 
 Still early: trusted nodes, small models, one physical host (a [free-cloud guide](net/deploy/README.md) covers crossing real ISPs) — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
@@ -26,6 +28,29 @@ The best open-weight models — DeepSeek, Llama, Qwen, Kimi — are published fr
 Today you can borrow access through free API tiers. That access is a **revocable favor**: free model lineups rotate and vanish without notice, whole countries are geo-blocked, and anyone without an international credit card is locked out of paid tiers. Open knowledge that depends on a vendor's goodwill is not open.
 
 Wikipedia wasn't built because commercial encyclopedias were bad. It was built so that knowledge wouldn't belong to anyone who could take it away. Sanad applies the same reasoning to running open models: **public infrastructure, owned by the people who run it.**
+
+## Two properties that define it
+
+**It grows and shrinks with the people in it.** The network always serves the
+largest model the pooled memory can hold. Someone joins with a spare laptop and
+the whole network upgrades to a bigger model; they leave and it steps back down
+without stopping. Nobody administers this — it is the capacity ladder, and it
+is in the code, not the roadmap ([proof](docs/PROOF.md)).
+
+**You can point anything at it.** The coordinator speaks the OpenAI-compatible
+API, so your agent, your editor, your script, your app — anything that already
+talks to a hosted model — works against your own community's network instead.
+Same tools, no subscription, no key, no company deciding whether you may.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://your-coordinator:7860/v1", api_key="not-needed")
+client.chat.completions.create(model="qwen2.5-1.5b-instruct-q4_k_m",
+                               messages=[{"role": "user", "content": "hello"}])
+```
+
+That is the whole argument: we built the thing, so we should not have to rent
+it back.
 
 ## The gap Sanad fills
 

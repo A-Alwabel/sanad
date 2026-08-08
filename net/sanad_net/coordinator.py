@@ -488,6 +488,8 @@ def make_handler(coord: Coordinator):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path in ("/v1/models", "/models"):
+                self._openai_models()
             elif self.path == "/status":
                 self._json(200, coord.status())
             elif self.path == "/ledger/audit":
@@ -532,6 +534,104 @@ def make_handler(coord: Coordinator):
 
             prompt = str(data["prompt"])[:MAX_MESSAGE_CHARS]
             return user, prompt, max_tokens, [{"role": "user", "content": prompt}]
+
+        # -- OpenAI-compatible surface -------------------------------------
+        # The point of Sanad is that a community can serve itself instead of
+        # renting access. That only works if the things people already use —
+        # agents, editors, scripts, SDKs — can point at it without being
+        # rewritten. So we speak the shape everything already speaks. The
+        # credits, the ladder and the fairness rules underneath are unchanged.
+
+        def _openai_models(self) -> None:
+            tier, _nodes, _pool = coord._compute_tier()
+            now = int(time.time())
+            data = [{"id": t.name, "object": "model", "created": now, "owned_by": "sanad",
+                     "sanad": {"serving": bool(tier and t.name == tier.name),
+                               "needs_pool_mb": round(t.need_mb, 1)}}
+                    for t in coord.catalog]
+            self._json(200, {"object": "list", "data": data})
+
+        def _openai_chat(self, data: dict) -> None:
+            """POST /v1/chat/completions — the endpoint every tool already knows."""
+            messages = data.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("messages must be a non-empty list")
+            raw_max = data.get("max_tokens") or data.get("max_completion_tokens") or 256
+            if isinstance(raw_max, float) and not math.isfinite(raw_max):
+                raise ValueError("max_tokens must be finite")
+            max_tokens = max(1, min(int(raw_max), MAX_TOKENS_CAP))
+            # OpenAI has no notion of who is contributing, so let a caller say
+            # so with the standard "user" field; otherwise they are a guest.
+            user = str(data.get("user") or "anon")
+            _u, _p, _n, clean = self._parse_ask({"user": user, "messages": messages,
+                                                 "max_tokens": max_tokens})
+            created = int(time.time())
+            cid = f"chatcmpl-sanad-{created}-{abs(hash(str(messages))) % 10**8}"
+
+            if not data.get("stream"):
+                result = coord.submit(user, _p, max_tokens, messages=clean)
+                self._json(200, {
+                    "id": cid, "object": "chat.completion", "created": created,
+                    "model": result["model"],
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": result["text"]}}],
+                    "usage": {"prompt_tokens": result.get("prompt_tokens", 0),
+                              "completion_tokens": result["decode_tokens"],
+                              "total_tokens": result.get("prompt_tokens", 0)
+                              + result["decode_tokens"]},
+                    # Sanad's own accounting, alongside the standard fields —
+                    # a caller can ignore it, or show who served them.
+                    "sanad": {"pipeline": result["pipeline"], "shard_map": result["shard_map"],
+                              "tok_per_s": result["tok_per_s"], "warm": result["engine_warm"]},
+                })
+                return
+
+            q: queue.Queue = queue.Queue()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def run():
+                try:
+                    coord.submit(user, _p, max_tokens, stream_q=q, messages=clean)
+                except Exception as exc:
+                    q.put(("error", f"{type(exc).__name__}: {exc}"))
+
+            threading.Thread(target=run, daemon=True).start()
+
+            def send(payload: dict) -> bool:
+                try:
+                    self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+
+            def chunk(delta: dict, finish=None) -> dict:
+                return {"id": cid, "object": "chat.completion.chunk", "created": created,
+                        "model": coord.status().get("model") or "sanad",
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+            if not send(chunk({"role": "assistant", "content": ""})):
+                return
+            while True:
+                kind, payload = q.get()
+                if kind == "token":
+                    if not send(chunk({"content": payload})):
+                        return
+                elif kind == "done":
+                    send(chunk({}, finish="stop"))
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                else:
+                    send({"error": {"message": payload, "type": "sanad_error"}})
+                    return
 
         def _stream_ask(self, data: dict) -> None:
             user, prompt, max_tokens, messages = self._parse_ask(data)
@@ -590,6 +690,8 @@ def make_handler(coord: Coordinator):
                     self._json(200, coord.submit(user, prompt, max_tokens, messages=messages))
                 elif self.path == "/ask/stream":
                     self._stream_ask(data)
+                elif self.path in ("/v1/chat/completions", "/chat/completions"):
+                    self._openai_chat(data)
                 else:
                     self._json(404, {"error": "unknown path"})
             except Exception as exc:

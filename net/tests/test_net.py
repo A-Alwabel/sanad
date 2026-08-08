@@ -684,6 +684,112 @@ class TestRegressionsFromReview(unittest.TestCase):
         self.assertFalse(r.active)
 
 
+class TestOpenAICompatibility(unittest.TestCase):
+    """The interface everything already speaks. If this drifts, tools break
+    silently — so the shape is asserted field by field."""
+
+    def _serve(self, coord):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    @staticmethod
+    def _post(base, path, payload):
+        req = urllib.request.Request(
+            f"{base}{path}", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    def test_models_endpoint_is_openai_shaped(self):
+        coord, _ = mk_coord()
+        server, base = self._serve(coord)
+        try:
+            with urllib.request.urlopen(f"{base}/v1/models", timeout=10) as r:
+                body = json.loads(r.read())
+            self.assertEqual(body["object"], "list")
+            ids = [m["id"] for m in body["data"]]
+            self.assertEqual(ids, ["small", "large"])
+            for m in body["data"]:
+                self.assertEqual(m["object"], "model")
+                self.assertIn("created", m)
+                self.assertIn("owned_by", m)
+                self.assertIn("serving", m["sanad"])      # the ladder, visible
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_chat_completion_shape_and_usage(self):
+        coord, _ = mk_coord()
+        server, base = self._serve(coord)
+        try:
+            body = self._post(base, "/v1/chat/completions", {
+                "model": "large", "user": "amina", "max_tokens": 25,
+                "messages": [{"role": "user", "content": "hello"}]})
+            self.assertEqual(body["object"], "chat.completion")
+            self.assertTrue(body["id"].startswith("chatcmpl-"))
+            choice = body["choices"][0]
+            self.assertEqual(choice["index"], 0)
+            self.assertEqual(choice["finish_reason"], "stop")
+            self.assertEqual(choice["message"]["role"], "assistant")
+            self.assertTrue(choice["message"]["content"])
+            self.assertEqual(body["usage"]["completion_tokens"], 25)
+            self.assertEqual(body["usage"]["total_tokens"],
+                             body["usage"]["prompt_tokens"] + 25)
+            # Sanad's own accounting rides alongside, never in place of, the standard fields
+            self.assertIn("shard_map", body["sanad"])
+            self.assertGreater(coord.ledger.balance("amina"), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_streaming_emits_chunks_then_DONE(self):
+        coord, _ = mk_coord()
+        server, base = self._serve(coord)
+        try:
+            req = urllib.request.Request(
+                f"{base}/v1/chat/completions",
+                data=json.dumps({"model": "large", "stream": True, "max_tokens": 20,
+                                 "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            events, done = [], False
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                self.assertIn("text/event-stream", resp.headers.get("Content-Type", ""))
+                buf = ""
+                for raw in resp:
+                    buf += raw.decode()
+                    while "\n\n" in buf:
+                        chunk, buf = buf.split("\n\n", 1)
+                        payload = chunk.strip()[len("data:"):].strip()
+                        if payload == "[DONE]":
+                            done = True
+                        elif payload:
+                            events.append(json.loads(payload))
+            self.assertTrue(done, "clients wait for the [DONE] sentinel")
+            self.assertTrue(all(e["object"] == "chat.completion.chunk" for e in events))
+            self.assertEqual(events[0]["choices"][0]["delta"]["role"], "assistant")
+            text = "".join(e["choices"][0]["delta"].get("content", "") for e in events)
+            self.assertEqual(text, "hello world")
+            self.assertEqual(events[-1]["choices"][0]["finish_reason"], "stop")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_openai_requests_obey_the_same_limits(self):
+        coord, _ = mk_coord()
+        server, base = self._serve(coord)
+        try:
+            body = self._post(base, "/v1/chat/completions", {
+                "model": "large", "max_tokens": 99999,       # far over the cap
+                "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(body["usage"]["completion_tokens"], 25)  # engine's fake reply
+            with self.assertRaises(urllib.error.HTTPError):
+                self._post(base, "/v1/chat/completions", {"model": "large", "messages": []})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class TestSetupAndRun(unittest.TestCase):
     """The install path is a feature: if it misleads a newcomer, nothing else matters."""
 

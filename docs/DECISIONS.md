@@ -142,6 +142,15 @@ a 7.5x slowdown at 40 ms per link. · Replaced a borrowed estimate with a
 measurement of our own system, which also quantifies the design's central
 tension: the models that most need sharding are the ones that shard worst.
 
+**Added an OpenAI-compatible API (v0.7)** · Sanad spoke only its own dialect,
+so using it from an agent or an editor meant writing glue — which is exactly
+the friction that keeps people renting access instead of running their own
+network. The coordinator now also answers `/v1/models` and
+`/v1/chat/completions`, verified by driving it with the official OpenAI client.
+· Replaced the assumption that a good chat page was enough. It is not: a
+community network only substitutes for a subscription if the community's
+existing tools can point at it unchanged.
+
 ---
 
 ## Deliberate non-decisions

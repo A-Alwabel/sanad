@@ -1,0 +1,44 @@
+
+==========================================================================
+  0. Start a small Sanad network
+==========================================================================
+   network up at http://192.168.0.188:7868; serving qwen2.5-0.5b-instruct-q4_k_m
+
+==========================================================================
+  A. Model discovery through the official OpenAI client
+==========================================================================
+   qwen2.5-0.5b-instruct-q4_k_m
+   qwen2.5-1.5b-instruct-q4_k_m
+
+==========================================================================
+  B. A plain chat completion
+==========================================================================
+   answer: A mining pool is a group of computers that work together to perform tasks on a cryptocurrency network, typically to validate transactions and increase
+   usage:  39 prompt + 29 completion
+
+==========================================================================
+  C. A conversation with a system prompt (what an agent needs)
+==========================================================================
+   answer: 42
+
+==========================================================================
+  D. Streaming, chunk by chunk
+==========================================================================
+   9 chunks -> 1
+2
+3
+4
+5
+
+==========================================================================
+  E. Standard interface, community economics underneath
+==========================================================================
+   served by RPC0 127.0.0.1:50160 layers 0-24
+   credited to: ['amina']
+   balances: {'amina': 29.0}
+
+==========================================================================
+  FOR EVERYTHING: PASS - an off-the-shelf client drove Sanad unmodified
+==========================================================================
+   Point any agent, editor or script at this address and it works.
+   No subscription, no key, no permission - the network is the community's.

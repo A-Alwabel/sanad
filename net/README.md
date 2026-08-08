@@ -13,6 +13,31 @@ transcripts in [proof/artifacts/](proof/artifacts/).
 coordinator's address. You get a chat page that shows, under every answer, which
 nodes served which layers, how fast, and who earned the credits.
 
+## Point your own tools at it
+
+The coordinator speaks the OpenAI-compatible API, so anything that already
+talks to a hosted model works against your community's network instead:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://192.168.0.10:7860/v1", api_key="not-needed")
+
+client.models.list()                       # the catalog, and which tier is live
+client.chat.completions.create(            # streaming works too (stream=True)
+    model="qwen2.5-1.5b-instruct-q4_k_m",
+    messages=[{"role": "user", "content": "hello"}],
+    user="amina")                          # optional: who gets the credit
+```
+
+Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (streaming and
+non-streaming). Any API key is accepted — v0 has no authentication, which is
+why the address belongs on a network you control. The reply carries a `sanad`
+field naming which nodes served which layers; ignore it and it is an ordinary
+completion.
+
+Not implemented: tool/function calling, embeddings, the legacy completions
+endpoint.
+
 ## What v0.4 adds
 
 - **One-command join** — `--discover` finds the coordinator by LAN broadcast;
@@ -173,6 +198,8 @@ python -m sanad_net.client --coordinator http://192.168.0.10:7860 statement --us
 
 ```powershell
 cd net
+python proof/run_openai_compat.py     # v0.7: an off-the-shelf OpenAI client drives Sanad
+python proof/run_two_networks.py      # v0.5: each node on its own network (needs Docker)
 python proof/run_v04.py               # v0.4: one-command join, memory, durable credits, concurrency
 python proof/run_it_works.py          # v0.3: resident pipeline, streaming, chat UI, real LAN
 python proof/run_living_network.py    # v0.2: capacity ladder, polite node, weighted credits

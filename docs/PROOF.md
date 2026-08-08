@@ -1,6 +1,6 @@
 # Proofs that Sanad works
 
-Five milestones, all fully reproducible:
+Six milestones, all fully reproducible:
 
 | Milestone | What it proves | Transcript | Reproduce |
 |---|---|---|---|
@@ -9,6 +9,7 @@ Five milestones, all fully reproducible:
 | **Part 3 — It Works** (v0.3) | Resident pipeline, live streaming, chat UI, real LAN | [it-works transcript](../net/proof/artifacts/it-works-2026-08-08.txt) | [run_it_works.py](../net/proof/run_it_works.py) |
 | **Part 4 — Usable Together** (v0.4) | One-command join, conversation memory, durable credits, concurrency | [v0.4 transcript](../net/proof/artifacts/v04-2026-08-08.txt) | [run_v04.py](../net/proof/run_v04.py) |
 | **Part 5 — Two Networks** (v0.5) | Sharding across genuinely isolated networks; WAN cost measured | [two-networks transcript](../net/proof/artifacts/two-networks-2026-08-08.txt) | [run_two_networks.py](../net/proof/run_two_networks.py) |
+| **Part 6 — For Everything** (v0.7) | An off-the-shelf OpenAI client drives Sanad unmodified | [openai-compat transcript](../net/proof/artifacts/openai-compat-2026-08-08.txt) | [run_openai_compat.py](../net/proof/run_openai_compat.py) |
 
 ---
 
@@ -420,3 +421,69 @@ boundary.
 
 The same proof with the second node on a free cloud VM across the public
 internet — the guide is written, the run is not yet recorded.
+
+
+---
+
+# Part 6 — For Everything (v0.7)
+
+**Date:** 2026-08-08 · **Status:** PASS · **Raw transcript:** [net/proof/artifacts/openai-compat-2026-08-08.txt](../net/proof/artifacts/openai-compat-2026-08-08.txt) · **Reproduce:** `python net/proof/run_openai_compat.py` (needs `pip install openai`)
+
+A network the community owns is only an alternative to renting access if the
+things people already use can point at it. Until now Sanad spoke only its own
+dialect, so anyone wanting to use it from an agent, an editor, or a script had
+to write glue. That is exactly the friction that keeps people on subscriptions.
+
+The coordinator now also speaks the interface everything already speaks. This
+proof drives it with the **official OpenAI client library**, which has never
+heard of this project.
+
+## A. Model discovery
+
+```
+qwen2.5-0.5b-instruct-q4_k_m
+qwen2.5-1.5b-instruct-q4_k_m
+```
+
+`/v1/models` answers in the standard shape, and each entry carries a `sanad`
+field saying whether the network can currently serve that tier — the capacity
+ladder, visible to any client that cares to look.
+
+## B, C, D. It behaves like the thing it claims to be
+
+```
+plain completion:  "A mining pool is a group of computers that work together..."
+                   usage: 39 prompt + 29 completion
+system prompt:     "Answer with a single number" + "6 times 7?"  ->  42
+streaming:         9 chunks -> 1 2 3 4 5, terminated by [DONE]
+```
+
+The system-prompt case is the one that matters for agents: instructions and
+question both arrive, and the answer obeys.
+
+## E. Standard interface, community economics underneath
+
+```
+served by RPC0 127.0.0.1:50160 layers 0-24
+credited to: ['amina']
+balances: {'amina': 29.0}
+```
+
+Nothing about the interface changed what Sanad is. The reply still says which
+nodes held which layers, serving still earns non-tradeable credits, the ladder
+still decides which model the pooled memory can hold, and anonymous callers are
+still served. A caller can ignore all of that and just get an answer.
+
+**What this means in practice:** point any OpenAI-compatible tool at
+`http://<coordinator>/v1` with any placeholder key. No subscription, no
+account, no permission — the network belongs to the people running it.
+
+## What Part 6 does not prove
+
+- **No authentication, still.** Anyone who can reach the coordinator can call
+  it as any account name. That is the documented v0 trust model, and it is why
+  the address belongs on a network you control.
+- Tool/function calling is not implemented; the surface is chat completions,
+  models, and streaming.
+- The trust, privacy, scale and centralised-coordination caveats from earlier
+  parts are unchanged.

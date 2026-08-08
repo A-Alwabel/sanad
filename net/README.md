@@ -34,6 +34,38 @@ some open weights carry terms worth reading before you serve others with them.
 `--add` downloads the file; pass it to the coordinator's `--models` list and
 the ladder inserts it at the right rung automatically.
 
+**Let it watch for you (the Scout):**
+
+```bash
+python -m sanad_net.models --watch                 # suggest a bigger model when your pool grows into one
+python -m sanad_net.models --watch --auto-fetch    # also download it (you still add it to --models)
+```
+
+The Scout never switches your served model on its own — it suggests, and a
+human adds. Automatic model *selection* is a governance decision and a
+supply-chain risk: a poisoned model topping a popularity list must not be able
+to deploy itself across the network. That is the same reason model changes are
+human-gated everywhere in Sanad.
+
+**Choose models by how they perform with YOUR users, not by download count.**
+Every answer carries a `request_id`; rate it and the coordinator tallies a
+per-model score:
+
+```bash
+# in the chat page: a thumbs up/down appears under each answer
+# or over the API:
+curl -X POST http://coordinator:7860/feedback      -d '{"request_id":"req-42","verdict":"up","user":"amina"}'
+curl http://coordinator:7860/feedback     # the per-model leaderboard, by your community
+```
+
+The score is the Wilson lower bound of the up-rate, so a model on two upvotes
+doesn't outrank one on two hundred, and `--feedback <file>` makes it durable.
+When ratings exist, the Scout ranks candidates by them first and download
+popularity only as a cold-start fallback — because how a model serves *your*
+people is the signal that matters. This is early, gameable data collection
+(anyone who can reach the coordinator can rate); fraud resistance is
+[RFC 0001](../docs/rfc/0001-human-loop.md)'s job.
+
 ## Point your own tools at it
 
 The coordinator speaks the OpenAI-compatible API, so anything that already

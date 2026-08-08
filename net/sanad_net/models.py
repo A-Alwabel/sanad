@@ -75,6 +75,29 @@ def search_models(query: str | None, limit: int = 40) -> list[dict]:
     return out
 
 
+def community_ratings(coordinator: str | None) -> dict[str, dict]:
+    """Per-model standing from your OWN network's users, keyed by model name.
+
+    This is the signal that matters: how a model performs *here*, not how
+    popular it is on a hub. Download count is a fallback for models nobody in
+    your community has tried yet (cold start).
+    """
+    if not coordinator:
+        return {}
+    try:
+        with urllib.request.urlopen(f"{coordinator}/feedback", timeout=10) as r:
+            data = json.loads(r.read())
+        return {row["model"]: row for row in data.get("ranking", [])}
+    except Exception:
+        return {}
+
+
+def _model_name(repo: str, filename: str) -> str:
+    """The catalog name a downloaded file gets — the GGUF stem, matching how
+    the coordinator names tiers, so ratings line up with repos."""
+    return Path(filename).stem
+
+
 # Files that end in .gguf but are NOT a loadable chat model:
 #  - mmproj / *proj*  : the vision projector for multimodal repos, useless alone
 #  - a split shard    : "...-00001-of-00003.gguf" is one piece; llama.cpp wants
@@ -269,6 +292,107 @@ def cmd_add(args: argparse.Namespace) -> None:
     print("one the pledged memory can hold.")
 
 
+def catalog_on_disk() -> list[dict]:
+    """The GGUF models already available to serve, smallest first."""
+    if not MODELS_DIR.exists():
+        return []
+    files = [{"path": f.name, "bytes": f.stat().st_size}
+             for f in MODELS_DIR.iterdir() if f.suffix == ".gguf"]
+    return sorted(files, key=lambda f: f["bytes"])
+
+
+def best_available(pool_mb: float) -> dict | None:
+    """The best model already downloaded that the current pool can serve."""
+    return best_fitting_file(catalog_on_disk(), usable_budget(pool_mb))
+
+
+def scout_once(pool_mb: float, search: str | None, limit: int,
+               coordinator: str | None = None) -> dict | None:
+    """Is there a better model than what's on disk that the pool could serve?
+
+    "Better" is judged first by how models perform with YOUR users (community
+    ratings from the running coordinator), and only then by download popularity
+    for models nobody here has tried yet. Returns the single best candidate to
+    add, or None. Never downloads anything.
+    """
+    budget = usable_budget(pool_mb)
+    have = best_available(pool_mb)
+    have_bytes = have["bytes"] if have else 0
+    ratings = community_ratings(coordinator)
+    candidates = []
+    for c in search_models(search, limit=limit):
+        files = repo_files(c["id"])
+        pick = best_fitting_file(files, budget)
+        if not pick:
+            continue
+        # Only worth suggesting if it's a meaningfully bigger rung we lack.
+        if pick["bytes"] <= have_bytes * 1.3 or (MODELS_DIR / pick["path"]).exists():
+            continue
+        lic = repo_license(c["id"])
+        name = _model_name(c["id"], pick["path"])
+        rated = ratings.get(name)
+        candidates.append({
+            "repo": c["id"], "file": pick["path"], "bytes": pick["bytes"],
+            "downloads": c["downloads"], "license": lic,
+            "permissive": lic.lower() in PERMISSIVE,
+            # community score if this exact model has been rated here; else -1
+            # so unrated models fall behind any that your users have judged.
+            "community_score": rated["score"] if rated else -1.0,
+            "community_ratings": rated["total"] if rated else 0,
+        })
+    if not candidates:
+        return None
+    # Rank: a model your users actually liked beats a bigger unknown one; among
+    # equally-(un)rated models, prefer the bigger rung.
+    candidates.sort(key=lambda c: (c["community_score"], c["bytes"]), reverse=True)
+    return candidates[0]
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    """The Scout: periodically check whether the network has outgrown its model,
+    and propose (or, only with --auto-fetch, download) a better one.
+
+    It never installs or switches a model on its own without --auto-fetch, and
+    even then it only DOWNLOADS — bringing a model into the live ladder is still
+    a human passing it to the coordinator. Automatic model *selection* is a
+    governance decision and a supply-chain risk: a poisoned model topping a
+    popularity list must never be able to deploy itself across the network.
+    """
+    import time as _time
+    print("Scout watching for models your network could grow into.")
+    print("It suggests; it does not silently change what you serve"
+          + (" (--auto-fetch: it will download, but you still add it)." if args.auto_fetch
+             else ".") + "\n")
+    seen: set[str] = set()
+    while True:
+        pool = args.pool_mb or current_pool_mb(args.coordinator)
+        if pool is None:
+            print("(no running network and no --pool-mb; nothing to size against)")
+            return
+        cand = scout_once(pool, args.search, args.limit, coordinator=args.coordinator)
+        if cand and cand["file"] not in seen:
+            seen.add(cand["file"])
+            print(f"[scout] your pool is now {human(pool * 1e6)}. A bigger model fits:")
+            lic = "" if cand["permissive"] else f"  (licence: {cand['license']} - read it)"
+            print(f"        {cand['repo']}")
+            print(f"        {cand['file']}  {human(cand['bytes'])}  "
+                  f"{cand['downloads']:,} downloads{lic}")
+            if args.auto_fetch and cand["permissive"]:
+                print("        --auto-fetch is on: downloading (you still add it to --models)")
+                url = f"https://huggingface.co/{cand['repo']}/resolve/main/{cand['file']}"
+                try:
+                    download(url, MODELS_DIR / cand["file"], cand["file"])
+                except Exception as exc:
+                    print(f"        download failed: {exc}")
+            else:
+                print(f"        add it:  python -m sanad_net.models --add {cand['repo']} "
+                      f"--quant {cand['file']}")
+            print()
+        if args.once:
+            return
+        _time.sleep(args.interval)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Find and add free open-weight models to your capacity ladder.")
@@ -280,10 +404,21 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=40, help="how many candidates to consider")
     ap.add_argument("--add", metavar="REPO", help="download a model and add it to the ladder")
     ap.add_argument("--quant", help="which quantization (default Q4_K_M), or an exact filename")
+    ap.add_argument("--watch", action="store_true",
+                    help="the Scout: keep checking whether the network could serve a "
+                         "bigger model, and suggest one")
+    ap.add_argument("--auto-fetch", action="store_true",
+                    help="with --watch: also DOWNLOAD a suggested permissive-licence model "
+                         "(you still add it to --models yourself)")
+    ap.add_argument("--interval", type=float, default=1800.0,
+                    help="with --watch: seconds between checks (default 30 min)")
+    ap.add_argument("--once", action="store_true", help="with --watch: check once and exit")
     ap.add_argument("--yes", "-y", action="store_true")
     args = ap.parse_args()
 
-    if args.add:
+    if args.watch:
+        cmd_watch(args)
+    elif args.add:
         cmd_add(args)
     else:
         cmd_list(args)

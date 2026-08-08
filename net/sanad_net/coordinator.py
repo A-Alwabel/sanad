@@ -39,6 +39,7 @@ from pathlib import Path
 
 from .discovery import DISCOVERY_PORT, DiscoveryResponder
 from .engine import EngineError, EngineManager
+from .feedback import FeedbackStore
 from .ledger import Ledger
 
 NODE_TTL_S = 15.0           # node considered dead if no heartbeat within this window
@@ -151,11 +152,14 @@ class Coordinator:
     CREDIT_HALF = 500.0        # credits for half the gap between guest and maximum rate
 
     def __init__(self, engines: EngineManager, catalog: list[ModelTier],
-                 ledger: Ledger | None = None, concurrency: int = 4) -> None:
+                 ledger: Ledger | None = None, concurrency: int = 4,
+                 feedback: FeedbackStore | None = None) -> None:
         self.registry = Registry()
         self.ledger = ledger if ledger is not None else Ledger()
+        self.feedback = feedback if feedback is not None else FeedbackStore()
         self.engines = engines
         self.catalog = catalog
+        self._recent: "deque[dict]" = deque(maxlen=256)   # request_id -> {model, prompt_hash}
         self.concurrency = max(1, concurrency)
         self.jobs_done = 0
         self.events: deque[dict] = deque(maxlen=1000)
@@ -427,9 +431,17 @@ class Coordinator:
                         f"(tokens={tokens}, devices={sorted(shard_map)}) - "
                         "no credits minted or charged")
         self.jobs_done += 1
+        # A stable id for this answer, so a client can rate the exact model that
+        # produced it — the link between "was this good?" and which model it was.
+        import hashlib
+        request_id = f"req-{job['seq']}"
+        prompt_hash = hashlib.sha256(job["prompt"].encode("utf-8")).hexdigest()[:16]
+        self._recent.append({"request_id": request_id, "model": tier.name,
+                             "prompt_hash": prompt_hash})
         return {
             "user": job["user"],
             "model": tier.name,
+            "request_id": request_id,           # rate this answer with POST /feedback
             "turns": len(job["messages"]),      # how much conversation was carried
             "priority_at_submit": -job["priority"],
             "repaired": repaired,
@@ -444,12 +456,28 @@ class Coordinator:
             **result,
         }
 
+    def headroom(self, tier: ModelTier | None, pool_mb: float) -> dict | None:
+        """If the pool could hold a bigger model than any rung in the catalog,
+        say so — this is how the network tells its operators it has outgrown
+        its ladder and it is worth running the Scout for a bigger model."""
+        biggest = self.catalog[-1] if self.catalog else None
+        if biggest is None or tier is None:
+            return None
+        if tier.name == biggest.name and pool_mb >= biggest.need_mb * 1.3:
+            return {"message": "the pool can hold a bigger model than any in the catalog; "
+                               "run `python -m sanad_net.models` to add a higher rung",
+                    "serving_need_mb": round(biggest.need_mb, 1),
+                    "pool_mb": round(pool_mb, 1)}
+        return None
+
     def status(self) -> dict:
         tier, nodes, pool_mb = self._compute_tier()
         eng = self.engines.engine
         return {
             "model": tier.name if tier else None,
             "pool_mb": round(pool_mb, 1),
+            "headroom": self.headroom(tier, pool_mb),
+            "model_ratings": self.feedback.ranking(),
             "catalog": [{"name": t.name, "file_mb": round(t.file_mb, 1),
                          "need_mb": round(t.need_mb, 1)} for t in self.catalog],
             "nodes": nodes,
@@ -502,6 +530,9 @@ def make_handler(coord: Coordinator):
                 self._openai_models()
             elif self.path == "/status":
                 self._json(200, coord.status())
+            elif self.path == "/feedback":
+                self._json(200, {"ranking": coord.feedback.ranking(),
+                                 "total_ratings": coord.feedback.total_ratings()})
             elif self.path == "/ledger/audit":
                 self._json(200, coord.ledger.audit())
             elif self.path.startswith("/ledger"):
@@ -695,6 +726,24 @@ def make_handler(coord: Coordinator):
                     ok = coord.registry.leave(data["node_id"])
                     coord.current_tier()  # re-evaluate the ladder on leave
                     self._json(200, {"ok": ok})
+                elif self.path == "/feedback":
+                    # Rate an answer: {request_id, verdict} or {model, verdict}.
+                    verdict = str(data.get("verdict", ""))
+                    model = data.get("model")
+                    prompt_hash = ""
+                    if data.get("request_id"):
+                        rec = next((r for r in reversed(coord._recent)
+                                    if r["request_id"] == data["request_id"]), None)
+                        if rec is None:
+                            raise ValueError("unknown request_id (too old or never served)")
+                        model, prompt_hash = rec["model"], rec["prompt_hash"]
+                    if not model:
+                        raise ValueError("provide request_id or model")
+                    coord.feedback.rate(str(model), verdict,
+                                        rater=str(data.get("user", "anon")),
+                                        prompt_hash=prompt_hash)
+                    self._json(200, {"ok": True, "model": model,
+                                     "score": round(coord.feedback.score(str(model)), 4)})
                 elif self.path == "/ask":
                     user, prompt, max_tokens, messages = self._parse_ask(data)
                     self._json(200, coord.submit(user, prompt, max_tokens, messages=messages))
@@ -726,6 +775,9 @@ def main() -> None:
     ap.add_argument("--ledger", default=None,
                     help="path to an append-only ledger file; credits survive restarts "
                          "(default: in-memory only)")
+    ap.add_argument("--feedback", default=None,
+                    help="path to an append-only feedback file, so per-model ratings "
+                         "survive restarts (default: in-memory only)")
     ap.add_argument("--concurrency", type=int, default=4,
                     help="how many requests to serve at once (engine slots)")
     ap.add_argument("--name", default="sanad", help="network name announced on the LAN")
@@ -737,7 +789,9 @@ def main() -> None:
     engines = EngineManager(Path(args.llama_bin).resolve(), port=args.engine_port,
                             slots=args.concurrency)
     ledger = Ledger(path=Path(args.ledger)) if args.ledger else Ledger()
-    coord = Coordinator(engines, catalog, ledger=ledger, concurrency=args.concurrency)
+    feedback = FeedbackStore(path=Path(args.feedback)) if args.feedback else FeedbackStore()
+    coord = Coordinator(engines, catalog, ledger=ledger, concurrency=args.concurrency,
+                        feedback=feedback)
     if args.bind != "127.0.0.1":
         print("[sanad-coordinator] NOTE: binding beyond loopback. v0 has no "
               "authentication and llama.cpp's RPC backend is not hardened — "
@@ -768,6 +822,7 @@ def main() -> None:
             responder.stop()
         engines.stop()          # stop serving before closing the books
         ledger.close()
+        feedback.close()
 
 
 if __name__ == "__main__":

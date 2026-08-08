@@ -48,6 +48,12 @@
   .meta .k{color:#6f7392}
   .meta .warm{color:var(--jade)}
   .meta .cold{color:var(--gold)}
+  .rate{margin-top:8px;display:flex;align-items:center;gap:8px}
+  .thumb{background:none;border:1px solid var(--line);border-radius:6px;padding:2px 9px;
+         font-size:14px;cursor:pointer;line-height:1.4;color:var(--paper);width:auto}
+  .thumb:hover:not(:disabled){border-color:var(--jade);background:rgba(40,164,135,.12)}
+  .thumb:disabled{opacity:.4;cursor:default}
+  .thanks{color:var(--jade);font-size:11px}
   .err{color:var(--red)}
   .cursor{display:inline-block;width:7px;height:15px;background:var(--gold);vertical-align:-2px;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
@@ -144,6 +150,29 @@
     return row.querySelector('.bubble');
   }
 
+  function addRating(meta, r){
+    if(!r.request_id) return;
+    var row = document.createElement('div');
+    row.className = 'rate';
+    row.innerHTML = '<span class="k">was this good?</span> '
+      + '<button class="thumb up" title="good">&#128077;</button>'
+      + '<button class="thumb down" title="not good">&#128078;</button>'
+      + '<span class="thanks"></span>';
+    function vote(verdict){
+      fetch('/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({request_id:r.request_id, verdict:verdict, user:userEl.value||'anon'})})
+        .then(function(x){ return x.json(); })
+        .then(function(){
+          row.querySelector('.thanks').textContent = ' thanks — noted for ' + esc(r.model);
+          row.querySelectorAll('.thumb').forEach(function(b){ b.disabled = true; });
+          refreshStatus();
+        }).catch(function(){});
+    }
+    row.querySelector('.up').addEventListener('click', function(){ vote('up'); });
+    row.querySelector('.down').addEventListener('click', function(){ vote('down'); });
+    meta.appendChild(row);
+  }
+
   function renderMeta(bubble, r){
     var chain = Object.keys(r.shard_map || {}).map(function(k){
       var d = r.shard_map[k];
@@ -162,6 +191,7 @@
       '  <span class="k">speed</span> ' + (r.tok_per_s||0) + ' tok/s' +
       '  <span class="k">first token</span> ' + (r.ttft_s||0) + 's<br>' +
       warm + '  <span class="k">·  credited to</span> ' + esc(ops || '—');
+    addRating(meta, r);
     bubble.appendChild(meta);
     scroll();
   }

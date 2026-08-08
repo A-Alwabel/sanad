@@ -710,6 +710,99 @@ class TestRegressionsFromReview(unittest.TestCase):
         self.assertFalse(r.active)
 
 
+class TestFeedback(unittest.TestCase):
+    """Choosing models by how they perform with real users."""
+
+    def test_wilson_rewards_evidence_not_luck(self):
+        from sanad_net.feedback import wilson_lower_bound
+        few = wilson_lower_bound(2, 2)          # 2/2
+        many = wilson_lower_bound(190, 200)     # 95%, well-evidenced
+        self.assertLess(few, many, "a big sample of 95% must outrank a perfect tiny one")
+        self.assertEqual(wilson_lower_bound(0, 0), 0.0)
+
+    def test_rating_ranking_and_durability(self):
+        import tempfile
+        from sanad_net.feedback import FeedbackStore
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "fb.jsonl"
+            fb = FeedbackStore(path=path)
+            for _ in range(9):
+                fb.rate("good-model", "up", rater="amina")
+            fb.rate("good-model", "down", rater="bob")
+            for _ in range(3):
+                fb.rate("meh-model", "up")
+            for _ in range(3):
+                fb.rate("meh-model", "down")
+            ranking = fb.ranking()
+            self.assertEqual(ranking[0]["model"], "good-model")   # 9/10 beats 3/6
+            self.assertEqual(ranking[0]["up"], 9)
+            fb.close()
+
+            revived = FeedbackStore(path=path)                    # survives restart
+            self.assertEqual(revived.ranking()[0]["model"], "good-model")
+            self.assertEqual(revived.total_ratings(), 16)
+            revived.close()
+
+    def test_bad_verdict_rejected(self):
+        from sanad_net.feedback import FeedbackStore
+        fb = FeedbackStore()
+        with self.assertRaises(ValueError):
+            fb.rate("m", "meh")
+        with self.assertRaises(ValueError):
+            fb.rate("", "up")
+
+    def test_feedback_endpoint_rates_the_served_answer(self):
+        coord, _ = mk_coord()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+
+        def post(path, payload):
+            req = urllib.request.Request(
+                f"{base}{path}", data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read())
+
+        try:
+            answer = post("/ask", {"user": "amina", "prompt": "hi", "max_tokens": 10})
+            rid = answer["request_id"]
+            self.assertTrue(rid, "every answer must be rateable")
+            res = post("/feedback", {"request_id": rid, "verdict": "up", "user": "amina"})
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["model"], "large")               # the served model
+            with urllib.request.urlopen(f"{base}/feedback", timeout=10) as r:
+                ranking = json.loads(r.read())["ranking"]
+            self.assertEqual(ranking[0]["model"], "large")
+            self.assertEqual(ranking[0]["up"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scout_prefers_a_model_your_users_liked(self):
+        from sanad_net import models
+        orig = (models.search_models, models.repo_files, models.repo_license,
+                models.catalog_on_disk, models.community_ratings)
+        try:
+            models.catalog_on_disk = lambda: [{"path": "have.gguf", "bytes": 2_000_000_000}]
+            models.search_models = lambda q, limit=40: [
+                {"id": "acme/loved", "downloads": 10},        # few downloads, loved here
+                {"id": "acme/famous", "downloads": 9_000_000}]  # famous, untried here
+            models.repo_files = lambda repo: [{"path": (
+                "loved-Q4_K_M.gguf" if "loved" in repo else "famous-Q4_K_M.gguf"),
+                "bytes": 6_000_000_000}]
+            models.repo_license = lambda repo: "apache-2.0"
+            models.community_ratings = lambda coord: {
+                "loved-Q4_K_M": {"model": "loved-Q4_K_M", "score": 0.8, "total": 40}}
+            cand = models.scout_once(pool_mb=12000, search=None, limit=40,
+                                     coordinator="http://x")
+            self.assertEqual(cand["repo"], "acme/loved",
+                             "a model your users rated well must beat a merely-popular one")
+        finally:
+            (models.search_models, models.repo_files, models.repo_license,
+             models.catalog_on_disk, models.community_ratings) = orig
+
+
 class TestModelDiscovery(unittest.TestCase):
     """Picking a model from a repo listing — the logic that grows the ladder."""
 
@@ -749,6 +842,50 @@ class TestModelDiscovery(unittest.TestCase):
         self.assertEqual(pick["path"], "m-Q4_K_M.gguf")
         # Tiny budget: nothing fits.
         self.assertIsNone(best_fitting_file(files, budget_mb=100))
+
+    def test_scout_suggests_only_a_bigger_fitting_model(self):
+        from sanad_net import models
+        # On disk: a small model. Repo listing: one that fits and is bigger,
+        # one that fits but is not meaningfully bigger, one too big.
+        orig_search, orig_files, orig_lic, orig_disk = (
+            models.search_models, models.repo_files, models.repo_license, models.catalog_on_disk)
+        try:
+            models.catalog_on_disk = lambda: [{"path": "have.gguf", "bytes": 2_000_000_000}]
+            models.search_models = lambda q, limit=40: [
+                {"id": "acme/bigger", "downloads": 999}, {"id": "acme/tiny", "downloads": 5}]
+            models.repo_files = lambda repo: (
+                [{"path": "bigger-Q4_K_M.gguf", "bytes": 6_000_000_000}] if "bigger" in repo
+                else [{"path": "tiny-Q4_K_M.gguf", "bytes": 2_100_000_000}])
+            models.repo_license = lambda repo: "apache-2.0"
+            cand = models.scout_once(pool_mb=12000, search=None, limit=40)
+            self.assertIsNotNone(cand)
+            self.assertEqual(cand["repo"], "acme/bigger")   # the meaningfully bigger one
+            self.assertTrue(cand["permissive"])
+        finally:
+            (models.search_models, models.repo_files, models.repo_license,
+             models.catalog_on_disk) = orig_search, orig_files, orig_lic, orig_disk
+
+    def test_scout_returns_none_when_ladder_is_maxed(self):
+        from sanad_net import models
+        orig_search, orig_files, orig_disk = (
+            models.search_models, models.repo_files, models.catalog_on_disk)
+        try:
+            models.catalog_on_disk = lambda: [{"path": "have.gguf", "bytes": 6_000_000_000}]
+            models.search_models = lambda q, limit=40: [{"id": "acme/x", "downloads": 1}]
+            models.repo_files = lambda repo: [{"path": "x.gguf", "bytes": 50_000_000_000}]
+            self.assertIsNone(models.scout_once(pool_mb=12000, search=None, limit=40))
+        finally:
+            models.search_models, models.repo_files, models.catalog_on_disk = (
+                orig_search, orig_files, orig_disk)
+
+    def test_headroom_flags_an_outgrown_ladder(self):
+        coord, _ = mk_coord(nodes=False)
+        # Pool far bigger than the largest catalog rung -> headroom advice.
+        big = coord.headroom(TIER_L, pool_mb=TIER_L.need_mb * 2)
+        self.assertIsNotNone(big)
+        self.assertIn("bigger model", big["message"])
+        # Serving a middle rung with room to spare -> no advice (climb happens on its own).
+        self.assertIsNone(coord.headroom(TIER_S, pool_mb=TIER_S.need_mb + 10))
 
     def test_param_parsing(self):
         from sanad_net.models import parse_params

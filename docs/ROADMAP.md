@@ -45,7 +45,7 @@ scrutiny from the people who built the priors.
   dataset; training explicitly deferred behind published unfreeze criteria.
   Built on five specialized research reviews (precedents, incentive integrity,
   poisoning, training stack, prior art) — see the RFC's references.
-- **NEXT — "The Scout" (semi-automatic catalog refresh):** the ladder's catalog
+- **STARTED 2026-08-08 — "The Scout" (semi-automatic catalog refresh):** the ladder's catalog
   should not go stale as better open models ship. Design: a scout job watches
   model releases and published evals and **proposes** catalog updates as public
   pull requests (with license check, size/need math, and pinned SHA-256);

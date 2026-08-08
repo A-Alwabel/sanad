@@ -196,6 +196,9 @@ def main() -> None:
         print(f"\n  Anyone on your network can join with:")
         say(f"      python -m sanad_net.run --join")
         say(f"  Or just open {url} in a browser to chat.")
+        if st.get("headroom"):
+            say(f"\n  Your network can already hold a bigger model than it's serving.")
+            say(f"  Grow the ladder:  python -m sanad_net.models")
         print("\n  Ctrl-C to stop.")
 
         if not args.no_browser:

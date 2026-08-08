@@ -11,7 +11,7 @@
 
 Still day one: single-machine, trusted nodes, small models — the honest scope is in the proof doc. Founding contributors wanted: read the [Concept](docs/CONCEPT.md) and open an issue.
 
-اقرأ الملخص بالعربية: [README.ar.md](README.ar.md)
+**[sanad site →](https://a-alwabel.github.io/sanad/)** · اقرأ الملخص بالعربية: [README.ar.md](README.ar.md)
 
 ---
 

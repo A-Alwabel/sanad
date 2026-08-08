@@ -11,8 +11,11 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
-# Local binaries and models (downloaded per net/README.md, never committed)
+# Binaries and models fetched by sanad_net.setup — never committed.
+# The glob matters: scratch copies (.local-backup/, .local-fresh-test/) hold
+# multi-hundred-MB model files, and the server rejects a push containing them.
 .local/
+.local-*/
 
 # Editors / OS
 .vscode/

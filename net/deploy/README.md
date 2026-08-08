@@ -14,7 +14,8 @@ either node — **the nodes cannot even resolve each other**, which is exactly
 Sanad's topology. Traffic crosses a routed TCP hop, not shared memory.
 
 ```bash
-python net/proof/run_two_networks.py
+cd net && python -m sanad_net.setup --yes   # the containers use these model files
+cd .. && python net/proof/run_two_networks.py
 ```
 
 That builds the images, brings up the stack, proves the isolation, runs sharded
@@ -71,14 +72,24 @@ curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
 tailscale ip -4        # note the VM's 100.x address
 ```
 
-**c. Build llama.cpp on the VM.** Upstream ships no standalone `rpc-server`
-binary, and an ARM VM needs an ARM build anyway:
+**c. Get llama.cpp on the VM.** On an x86-64 VM, let Sanad fetch it:
+
+```bash
+git clone https://github.com/A-Alwabel/sanad && cd sanad/net
+python3 -m sanad_net.setup --yes --models small
+```
+
+On an **ARM** VM there is no prebuilt release, so build it — and note the
+binary must end up named `ggml-rpc-server`, which is what the node looks for:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y build-essential cmake git python3
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 cmake -B build -DGGML_RPC=ON -DLLAMA_CURL=OFF
 cmake --build build --config Release -j --target rpc-server llama-server
+mkdir -p ~/sanad/.local/bin
+cp build/bin/rpc-server ~/sanad/.local/bin/ggml-rpc-server   # the name matters
+cp build/bin/llama-server build/bin/*.so* ~/sanad/.local/bin/ 2>/dev/null || true
 ```
 
 **d. Run the node on the VM**, bound to the mesh address — never `0.0.0.0`:

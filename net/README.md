@@ -115,38 +115,57 @@ are implemented but have not had a recorded milestone run.
 - Nodes can reconstruct prompts from the activations passing through them — an
   unsolved problem across this whole field, not just here.
 
-## Setup
+## Get started
 
-```powershell
-# 1. llama.cpp binaries (build b10276 or later; needs ggml-rpc-server + llama-server)
-#    from https://github.com/ggml-org/llama.cpp/releases  ->  unzip into ..\.local\bin
-# 2. A small GGUF model, e.g. Qwen2.5-0.5B-Instruct q4_k_m (~470 MB)
-#    https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF  ->  save into ..\.local\models
+Two commands. You need Python 3.12+ and about 1.6 GB of disk.
+
+```bash
+cd net
+python -m sanad_net.setup     # fetches llama.cpp for your machine + two small models
+python -m sanad_net.run       # starts a network and opens the chat page
 ```
 
-## Run it
+`setup` tells you exactly what it will download and how big it is before it
+starts, puts everything in `.local/` next to the repo, and installs nothing
+system-wide — delete that folder to undo all of it. It picks the right build
+for Windows / macOS / Linux and x64 / ARM automatically, and refuses anything
+older than the llama.cpp release that fixed CVE-2026-34159.
 
-```powershell
-cd net
+`run` starts a coordinator and one node on your machine, waits until the
+network is ready, and opens your browser. Ctrl-C stops everything it started.
+Useful flags:
 
-# terminal 1 — coordinator with a capacity-ladder catalog (small,large).
-# --bind 0.0.0.0 lets nodes and browsers on your network reach it;
-# --ledger keeps everyone's credits across restarts.
-python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0 `
-    --models ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf,../.local/models/qwen2.5-1.5b-instruct-q4_k_m.gguf `
-    --llama-bin ../.local/bin --ledger ../.local/ledger.jsonl
+```bash
+python -m sanad_net.run --name amina        # the account your contribution is credited to
+python -m sanad_net.run --pledge-mb 4000    # lend more memory (default 1500)
+python -m sanad_net.run --dedicated         # a spare box: never pause for an "owner"
+python -m sanad_net.run --no-browser
+```
 
-# terminals 2 & 3 — nodes (in real life: two different people's machines).
-# --discover finds the coordinator on your network; no address needed.
-python -m sanad_net.node --node-id riyadh-a --operator amina --port 50070 `
-    --pledge-mb 1000 --busy-at 101 --discover --rpc-bin ../.local/bin
-python -m sanad_net.node --node-id jeddah-b --operator bilal --port 50071 `
-    --pledge-mb 700 --discover --rpc-bin ../.local/bin
+### Let someone else join
 
-# then: open http://192.168.0.10:7860/ in a browser and start typing.
-# or from a terminal:
+On their machine, after the same `setup`:
+
+```bash
+python -m sanad_net.run --join
+```
+
+That finds your coordinator on the local network by broadcast — no address to
+type. If they are somewhere else, give them the address instead:
+`--join http://192.168.0.10:7860`. Their credits are theirs, and are kept if
+they leave.
+
+### Running the parts by hand
+
+`run` is a convenience; every piece is a normal module you can start yourself,
+which is what you want on a server or when the defaults do not fit:
+
+```bash
+python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0     --models ../.local/models/qwen2.5-0.5b-instruct-q4_k_m.gguf,../.local/models/qwen2.5-1.5b-instruct-q4_k_m.gguf     --llama-bin ../.local/bin --ledger ../.local/ledger.jsonl
+
+python -m sanad_net.node --node-id riyadh-a --operator amina --port 50070     --pledge-mb 1000 --busy-at 101 --discover --rpc-bin ../.local/bin
+
 python -m sanad_net.client --coordinator http://192.168.0.10:7860 ask --user amina "What is a mining pool?"
-python -m sanad_net.client --coordinator http://192.168.0.10:7860 status
 python -m sanad_net.client --coordinator http://192.168.0.10:7860 statement --user amina
 ```
 

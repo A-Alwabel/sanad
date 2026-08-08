@@ -684,6 +684,66 @@ class TestRegressionsFromReview(unittest.TestCase):
         self.assertFalse(r.active)
 
 
+class TestSetupAndRun(unittest.TestCase):
+    """The install path is a feature: if it misleads a newcomer, nothing else matters."""
+
+    def test_asset_pattern_covers_every_supported_platform(self):
+        from sanad_net import setup
+        import platform as plat
+        cases = [("Windows", "AMD64", "bin-win-cpu-x64"), ("Windows", "ARM64", "bin-win-cpu-arm64"),
+                 ("Darwin", "arm64", "bin-macos-arm64"), ("Darwin", "x86_64", "bin-macos-x64"),
+                 ("Linux", "x86_64", "bin-ubuntu-x64"), ("Linux", "aarch64", "bin-ubuntu-arm64")]
+        orig_system, orig_machine = plat.system, plat.machine
+        try:
+            for system, machine, expected in cases:
+                plat.system = lambda s=system: s
+                plat.machine = lambda m=machine: m
+                pattern, label = setup.asset_pattern()
+                self.assertEqual(pattern, expected, f"{system}/{machine}")
+                self.assertTrue(label, "every platform needs a human-readable label")
+        finally:
+            plat.system, plat.machine = orig_system, orig_machine
+
+    def test_unsupported_platform_says_what_to_do(self):
+        from sanad_net import setup
+        import platform as plat
+        orig = plat.system
+        try:
+            plat.system = lambda: "Plan9"
+            with self.assertRaises(SystemExit) as ctx:
+                setup.asset_pattern()
+            self.assertIn("--llama-bin", str(ctx.exception))   # tells them the way out
+        finally:
+            plat.system = orig
+
+    def test_min_build_matches_the_node_guard(self):
+        # Two copies of a security constant is one too many to let drift.
+        from sanad_net import node, setup
+        self.assertEqual(setup.MIN_BUILD, node.MIN_LLAMA_BUILD)
+
+    def test_preflight_names_what_is_missing(self):
+        from sanad_net import run as run_mod
+        orig_build, orig_dir = run_mod.installed_build, run_mod.MODELS_DIR
+        try:
+            run_mod.installed_build = lambda: None
+            run_mod.MODELS_DIR = Path("/nonexistent-for-tests")
+            problems = run_mod.preflight()
+            self.assertTrue(any("llama.cpp" in p for p in problems))
+            self.assertTrue(any("model" in p for p in problems))
+
+            run_mod.installed_build = lambda: 1  # ancient build
+            self.assertTrue(any("too old" in p for p in run_mod.preflight()))
+        finally:
+            run_mod.installed_build, run_mod.MODELS_DIR = orig_build, orig_dir
+
+    def test_human_readable_sizes(self):
+        from sanad_net.setup import human
+        self.assertEqual(human(512), "512 B")
+        self.assertEqual(human(2 * 1024), "2 KB")
+        self.assertEqual(human(5 * 1024 * 1024), "5 MB")
+        self.assertEqual(human(3 * 1024 ** 3), "3.0 GB")
+
+
 class TestHTTPSurface(unittest.TestCase):
     def _serve(self, coord):
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))

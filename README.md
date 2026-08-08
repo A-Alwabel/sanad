@@ -66,16 +66,28 @@ Honesty is a design principle here (over-promising is how this field loses trust
 
 ## Try it
 
-**The real thing** ([net/](net/)) — actual sharded inference through llama.cpp, with Sanad's coordinator, credit ledger, and chat page on top (needs the llama.cpp binaries + a small GGUF model, setup in [net/README.md](net/README.md)):
+**Run it** — two commands, ~1.6 GB of disk, Python 3.12+:
 
 ```bash
 cd net
-python -m unittest discover -s tests -v      # unit tests, no binaries needed
-python proof/run_v04.py                      # full network + proof, ends in "V0.4: PASS"
+python -m sanad_net.setup     # fetches llama.cpp for your machine + two small models
+python -m sanad_net.run       # starts a network and opens the chat page
+```
 
-# or just run it and open the chat page in a browser:
-python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0 --models <small.gguf>,<large.gguf> --llama-bin ../.local/bin
-python -m sanad_net.node --node-id mynode --operator me --host 0.0.0.0 --port 50070 --pledge-mb 1000 --rpc-bin ../.local/bin --coordinator http://<your-ip>:7860
+`setup` says what it will download before it does, and puts everything in a single `.local/` folder you can delete. Anyone else on your network joins with `python -m sanad_net.run --join` — no address to type. Details and manual control: [net/README.md](net/README.md).
+
+Reproduce any of the recorded proofs:
+
+```bash
+python net/proof/run_two_networks.py   # each node on its own network (needs Docker)
+python net/proof/run_v04.py            # conversations, durable credits, concurrency
+python net/proof/run_it_works.py       # resident pipeline, streaming, chat page
+```
+
+**Just want to see the idea in 10 seconds?** No downloads, no setup:
+
+```bash
+cd prototype && python -m sanad.demo
 ```
 
 **The simulation** ([prototype/](prototype/)) — dependency-free model of the network semantics (sharding, pipeline assembly, credit priority), useful for understanding and testing the fairness logic:

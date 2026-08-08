@@ -21,11 +21,14 @@ is authoritative; the simulation illustrates concepts.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+MAX_ENTRIES_IN_MEMORY = 200_000   # the file is the record; memory keeps a window
 
 
 @dataclass
@@ -46,35 +49,72 @@ class Ledger:
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _fh: object = field(default=None, repr=False)
 
+    _closed: bool = False
+
     def __post_init__(self) -> None:
         if self.path is None:
             return
         self.path = Path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._repair_torn_tail()
         self._replay()
         self._fh = open(self.path, "a", encoding="utf-8")
 
-    # -- durability ----------------------------------------------------------
-    def _replay(self) -> None:
-        """Rebuild balances from the file. Malformed trailing lines (a crash
-        mid-write) are skipped rather than fatal."""
+    def _repair_torn_tail(self) -> None:
+        """Truncate a half-written final line left by a crash.
+
+        Without this, the next append lands on the same line and silently
+        destroys the following entry too — losing a credit in exactly the crash
+        the durable ledger exists to survive.
+        """
         if not self.path.exists():
             return
-        with open(self.path, "r", encoding="utf-8") as fh:
+        with open(self.path, "r+b") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size == 0:
+                return
+            fh.seek(size - 1)
+            if fh.read(1) == b"\n":
+                return
+            fh.seek(0)
+            data = fh.read()
+            cut = data.rfind(b"\n")
+            fh.truncate(cut + 1 if cut >= 0 else 0)
+
+    # -- durability ----------------------------------------------------------
+    @staticmethod
+    def _read_file(path: Path) -> tuple[list[CreditEntry], dict[str, float]]:
+        """Parse a ledger file into entries and balances. Malformed lines are
+        skipped rather than fatal; non-finite numbers are rejected outright
+        (the same poisoning class /register guards against)."""
+        entries: list[CreditEntry] = []
+        balances: dict[str, float] = {}
+        if not path.exists():
+            return entries, balances
+        with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     rec = json.loads(line)
-                    entry = CreditEntry(float(rec["ts"]), str(rec["account"]),
-                                        float(rec["delta"]), str(rec.get("reason", "")))
+                    ts, delta = float(rec["ts"]), float(rec["delta"])
+                    if not (math.isfinite(ts) and math.isfinite(delta)):
+                        continue
+                    entry = CreditEntry(ts, str(rec["account"]), delta, str(rec.get("reason", "")))
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue
-                self._entries.append(entry)
-                self._balances[entry.account] = self._balances.get(entry.account, 0.0) + entry.delta
+                entries.append(entry)
+                balances[entry.account] = balances.get(entry.account, 0.0) + entry.delta
+        return entries, balances
+
+    def _replay(self) -> None:
+        self._entries, self._balances = self._read_file(self.path)
 
     def _append(self, entry: CreditEntry) -> None:
+        """Durably record an entry. Raises if it cannot be written — the caller
+        must not apply a credit that is not on disk."""
         if self._fh is None:
             return
         self._fh.write(json.dumps({
@@ -84,34 +124,53 @@ class Ledger:
         self._fh.flush()
         os.fsync(self._fh.fileno())   # a credit that is not on disk was not earned
 
+    def _apply(self, entry: CreditEntry) -> None:
+        """Write first, then apply in memory — so a failed write can never
+        leave a phantom balance that the file does not back."""
+        self._append(entry)
+        self._balances[entry.account] = self._balances.get(entry.account, 0.0) + entry.delta
+        self._entries.append(entry)
+        if len(self._entries) > MAX_ENTRIES_IN_MEMORY:
+            del self._entries[:len(self._entries) - MAX_ENTRIES_IN_MEMORY]
+
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             if self._fh is not None:
                 self._fh.close()
                 self._fh = None
 
     # -- operations ----------------------------------------------------------
     def earn(self, account: str, amount: float, reason: str) -> None:
-        if amount <= 0:
+        if amount <= 0 or not math.isfinite(amount):
             return
         with self._lock:
-            entry = CreditEntry(time.time(), account, amount, reason)
-            self._balances[account] = self._balances.get(account, 0.0) + amount
-            self._entries.append(entry)
-            self._append(entry)
+            if self._closed and self.path is not None:
+                raise RuntimeError("ledger is closed; refusing to mint credits it cannot record")
+            self._apply(CreditEntry(time.time(), account, amount, reason))
 
     def spend(self, account: str, amount: float, reason: str) -> float:
         """Burn up to `amount`; clamps at zero (anonymous users are demoted,
         never blocked). Returns the amount actually burned."""
+        return self.reserve(account, amount, reason)[1]
+
+    def reserve(self, account: str, amount: float, reason: str) -> tuple[float, float]:
+        """Atomically read the balance and burn up to `amount` from it.
+
+        Returns (balance_before, burned). One lock acquisition, so two
+        concurrent requests from the same account cannot both price themselves
+        off the same pre-spend balance.
+        """
+        if not math.isfinite(amount):
+            raise ValueError("amount must be finite")
         with self._lock:
-            bal = self._balances.get(account, 0.0)
-            spent = min(bal, max(amount, 0.0))
-            if spent > 0:
-                entry = CreditEntry(time.time(), account, -spent, reason)
-                self._balances[account] = bal - spent
-                self._entries.append(entry)
-                self._append(entry)
-            return spent
+            if self._closed and self.path is not None:
+                raise RuntimeError("ledger is closed; refusing to record a spend")
+            before = self._balances.get(account, 0.0)
+            burned = min(before, max(amount, 0.0))
+            if burned > 0:
+                self._apply(CreditEntry(time.time(), account, -burned, reason))
+            return before, burned
 
     def balance(self, account: str) -> float:
         with self._lock:
@@ -126,16 +185,36 @@ class Ledger:
             return list(self._entries)
 
     def audit(self) -> dict:
-        """Recompute balances from the entry log — the check anyone can repeat
-        against the published file."""
+        """Re-read the ledger FILE from disk and compare it to the live balances.
+
+        This is the check anyone holding the file can repeat, and the only
+        version worth trusting: comparing two in-memory structures that are
+        updated in the same breath proves nothing. An in-memory-only ledger
+        reports durable=false rather than pretending to be verified.
+        """
         with self._lock:
-            recomputed: dict[str, float] = {}
-            for e in self._entries:
-                recomputed[e.account] = recomputed.get(e.account, 0.0) + e.delta
-            mismatches = {
-                a: {"cached": round(self._balances.get(a, 0.0), 6), "replayed": round(v, 6)}
-                for a, v in recomputed.items()
-                if abs(self._balances.get(a, 0.0) - v) > 1e-6
-            }
-            return {"entries": len(self._entries), "accounts": len(recomputed),
-                    "consistent": not mismatches, "mismatches": mismatches}
+            live = dict(self._balances)
+            if self.path is None:
+                return {"durable": False, "consistent": None,
+                        "note": "in-memory ledger; start the coordinator with --ledger to make "
+                                "credits durable and independently auditable",
+                        "entries_in_memory": len(self._entries), "accounts": len(live)}
+            if self._fh is not None:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+            file_entries, file_balances = self._read_file(self.path)
+
+        accounts = set(live) | set(file_balances)
+        mismatches = {
+            a: {"live": round(live.get(a, 0.0), 6), "on_disk": round(file_balances.get(a, 0.0), 6)}
+            for a in accounts
+            if abs(live.get(a, 0.0) - file_balances.get(a, 0.0)) > 1e-6
+        }
+        return {
+            "durable": True,
+            "path": str(self.path),
+            "entries_on_disk": len(file_entries),
+            "accounts": len(accounts),
+            "consistent": not mismatches,
+            "mismatches": mismatches,
+        }

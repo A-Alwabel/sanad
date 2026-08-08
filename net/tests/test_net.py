@@ -1,7 +1,8 @@
-"""Unit tests for sanad_net v0.3 (no llama.cpp binaries or model required)."""
+"""Unit tests for sanad_net (no llama.cpp binaries or model required)."""
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
 import threading
@@ -15,7 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sanad_net.coordinator import (  # noqa: E402
-    CapacityError, ChainFailure, Coordinator, ModelTier, Registry, make_handler, pick_tier,
+    NODE_TTL_S, CapacityError, ChainFailure, Coordinator, ModelTier, Registry,
+    make_handler, pick_tier,
 )
 from sanad_net.engine import EngineError, parse_shard_map  # noqa: E402
 from sanad_net.ledger import Ledger  # noqa: E402
@@ -307,12 +309,13 @@ class TestCoordinatorScheduling(unittest.TestCase):
         self.assertTrue(any("escrow for job" in r for r in reasons))
         self.assertTrue(any("escrow refund" in r for r in reasons))
 
-    def test_priority_orders_queue_deterministically(self):
-        # Priority only binds under contention, so this is a single-slot server:
-        # with free slots every job is admitted at once and order is moot.
+    def test_credits_buy_priority_when_the_server_is_saturated(self):
+        # Priority is rate x waiting time: a well-funded account accrues faster,
+        # so it overtakes a guest who was queued first. It cannot skip an
+        # arbitrarily long queue — see the starvation-bound test below.
         gate = threading.Event()
         coord, engines = mk_coord(FakeEngines(gate=gate), concurrency=1)
-        coord.ledger.earn("vip", 100, "operated a node")
+        coord.ledger.earn("vip", 100_000, "operated many nodes")
         threads = [threading.Thread(target=coord.submit, args=("anon", "filler", 10))]
         threads[0].start()
         while not engines.calls:
@@ -324,8 +327,39 @@ class TestCoordinatorScheduling(unittest.TestCase):
         for t in threads:
             t.join(timeout=10)
         self.assertEqual(engines.calls[0], "filler")
-        self.assertEqual(engines.calls[1], "vip-q")   # credits beat arrival order
-        self.assertEqual(engines.calls[2], "zed-q")   # anonymous still served
+        self.assertEqual(engines.calls[1], "vip-q")   # credits won despite arriving later
+        self.assertEqual(engines.calls[2], "zed-q")   # the guest is still served
+
+    def test_a_guest_who_waits_long_enough_overtakes_a_richer_newcomer(self):
+        # The property static-priority queueing does NOT have (Cobham 1954):
+        # a zero-credit job's score keeps climbing, so it cannot be deferred
+        # forever by a stream of better-funded arrivals.
+        coord, _ = mk_coord(nodes=False, concurrency=1)
+        now = time.time()
+        guest = {"user": "zed", "priority": 0.0, "seq": 1, "submitted_at": now - 60}
+        whale = {"user": "vip", "priority": -100_000.0, "seq": 2, "submitted_at": now - 1}
+        coord._pending = [guest, whale]
+        coord._served = 1                     # not a reserve-lane slot
+        picked = coord._pop_next_locked()
+        self.assertIs(picked, guest, "a long-waiting guest must eventually win")
+
+    def test_reserve_lane_rotates_across_accounts_not_jobs(self):
+        # One guest flooding the queue must not own the whole reserve lane and
+        # starve the other guests it exists to protect.
+        coord, _ = mk_coord(nodes=False, concurrency=1)
+        now = time.time()
+        coord._pending = [
+            {"user": "flooder", "priority": 0.0, "seq": 1, "submitted_at": now - 10},
+            {"user": "flooder", "priority": 0.0, "seq": 2, "submitted_at": now - 9},
+            {"user": "quiet", "priority": 0.0, "seq": 3, "submitted_at": now - 8},
+        ]
+        coord._served = 2                     # next pop is the reserve lane
+        first = coord._pop_next_locked()
+        self.assertEqual(first["user"], "flooder")
+        coord._served = 2                     # reserve lane again
+        second = coord._pop_next_locked()
+        self.assertEqual(second["user"], "quiet",
+                         "the lane must rotate to an account that has not just been served")
 
     def test_anti_starvation_fifo_slot(self):
         gate = threading.Event()
@@ -381,14 +415,16 @@ class TestCoordinatorScheduling(unittest.TestCase):
     def test_chain_repair_evicts_stale_and_retries_with_survivor(self):
         gate = threading.Event()
         coord, engines = mk_coord(FakeEngines(gate=gate, fail_times=1), concurrency=1)
-        for nid in ("n1", "n2"):     # registration precedes the job on a coarse clock
-            coord.registry._nodes[nid]["last_seen"] -= 1.0
+        # n2 has been genuinely silent past the TTL; n1 is heartbeating normally.
+        # A node that is merely quiet for a second must NOT be evicted because
+        # some other request failed.
+        coord.registry._nodes["n2"]["last_seen"] = time.time() - (NODE_TTL_S + 5)
         box: dict = {}
         t = threading.Thread(target=lambda: box.update(r=coord.submit("anon", "hello", 25)))
         t.start()
         while not engines.calls:
             time.sleep(0.01)
-        coord.registry.heartbeat("n1")   # n1 is fresh -> survives; n2 is stale -> suspected
+        coord.registry.heartbeat("n1")   # n1 is fresh -> survives; n2 is silent -> evicted
         gate.set()
         t.join(timeout=10)
         r = box["r"]
@@ -457,13 +493,16 @@ class TestLedgerDurability(unittest.TestCase):
             revived.close()
 
     def test_audit_detects_tampering(self):
-        led = Ledger()
-        led.earn("amina", 10.0, "served")
-        self.assertTrue(led.audit()["consistent"])
-        led._balances["amina"] = 999.0                        # simulate a corrupted cache
-        audit = led.audit()
-        self.assertFalse(audit["consistent"])
-        self.assertIn("amina", audit["mismatches"])
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            led = Ledger(path=Path(d) / "l.jsonl")            # auditing needs a file to read
+            led.earn("amina", 10.0, "served")
+            self.assertTrue(led.audit()["consistent"])
+            led._balances["amina"] = 999.0                    # simulate a corrupted cache
+            audit = led.audit()
+            self.assertFalse(audit["consistent"])
+            self.assertIn("amina", audit["mismatches"])
+            led.close()
 
 
 class TestConcurrency(unittest.TestCase):
@@ -514,6 +553,135 @@ class TestDiscovery(unittest.TestCase):
             self.assertTrue(ours[0]["coordinator"].endswith(":7899"))
         finally:
             responder.stop()
+
+
+class TestRegressionsFromReview(unittest.TestCase):
+    """Each of these encodes a bug an adversarial review found in v0.4."""
+
+    def test_stream_errors_become_EngineError_so_repair_can_act(self):
+        # ConnectionResetError is NOT a URLError; catching only URLError let a
+        # dead pipeline bypass chain repair entirely.
+        from sanad_net.engine import STREAM_ERRORS
+        for exc in (ConnectionResetError, http.client.IncompleteRead,
+                    urllib.error.URLError, OSError):
+            self.assertTrue(issubclass(exc, STREAM_ERRORS),
+                            f"{exc.__name__} must be treated as a stream failure")
+
+    def test_engine_drains_inflight_before_a_rebuild_stops_it(self):
+        from sanad_net.engine import Engine
+        eng = Engine.__new__(Engine)                 # no subprocess needed
+        eng._inflight = 0
+        eng._idle = threading.Condition()
+        eng._retired = False
+        eng.proc = None
+        stopped_at: list[float] = []
+        eng.stop = lambda: stopped_at.append(time.time())
+
+        with eng._idle:                              # simulate one in-flight answer
+            eng._inflight = 1
+        released_at: list[float] = []
+
+        def finish_later():
+            time.sleep(0.3)
+            with eng._idle:
+                eng._inflight -= 1
+                released_at.append(time.time())
+                eng._idle.notify_all()
+
+        threading.Thread(target=finish_later, daemon=True).start()
+        self.assertTrue(eng.retire(timeout_s=5))
+        self.assertTrue(stopped_at and released_at)
+        self.assertGreaterEqual(stopped_at[0], released_at[0],
+                                "the engine stopped before the in-flight answer finished")
+
+    def test_healthy_nodes_are_not_evicted_by_one_failed_request(self):
+        coord, engines = mk_coord(FakeEngines(fail_times=1), concurrency=1)
+        coord.registry.heartbeat("n1")
+        coord.registry.heartbeat("n2")               # both freshly alive
+        coord.submit("anon", "hello", 25)
+        self.assertEqual({n["node_id"] for n in coord.registry.alive()}, {"n1", "n2"},
+                         "a heartbeating node must survive another request's failure")
+
+    def test_ladder_budget_accounts_for_concurrency(self):
+        one = ModelTier(name="m", path=Path("m.gguf"), file_mb=1000.0, slots=1)
+        many = ModelTier(name="m", path=Path("m.gguf"), file_mb=1000.0, slots=8)
+        self.assertGreater(many.need_mb, one.need_mb,
+                           "more concurrent slots need more KV cache, so more pooled memory")
+
+    def test_system_message_survives_truncation(self):
+        from sanad_net.coordinator import MAX_MESSAGES
+        coord, _ = mk_coord(nodes=False)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(coord))
+        handler = make_handler(coord)
+        parse = handler._parse_ask
+        long_convo = [{"role": "system", "content": "always answer in French"}]
+        for i in range(MAX_MESSAGES + 10):
+            long_convo.append({"role": "user" if i % 2 == 0 else "assistant",
+                               "content": f"m{i}"})
+        long_convo.append({"role": "user", "content": "final question"})
+        _user, _prompt, _n, msgs = parse(handler, {"messages": long_convo})
+        server.server_close()
+        self.assertEqual(msgs[0]["role"], "system", "the system message must not be trimmed away")
+        self.assertEqual(msgs[0]["content"], "always answer in French")
+        self.assertEqual(msgs[-1]["content"], "final question")
+        self.assertLessEqual(len(msgs), MAX_MESSAGES)
+
+    def test_audit_reports_in_memory_ledgers_as_not_durable(self):
+        audit = Ledger().audit()
+        self.assertFalse(audit["durable"])
+        self.assertIsNone(audit["consistent"])       # never claims verification it didn't do
+
+    def test_audit_reads_the_file_and_catches_divergence(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            led = Ledger(path=Path(d) / "l.jsonl")
+            led.earn("amina", 10.0, "served")
+            self.assertTrue(led.audit()["consistent"])
+            led._balances["amina"] = 999.0           # memory now disagrees with disk
+            audit = led.audit()
+            self.assertFalse(audit["consistent"])
+            self.assertEqual(audit["mismatches"]["amina"]["on_disk"], 10.0)
+            led.close()
+
+    def test_closed_durable_ledger_refuses_to_mint(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            led = Ledger(path=Path(d) / "l.jsonl")
+            led.close()
+            with self.assertRaises(RuntimeError):
+                led.earn("amina", 5.0, "served")     # silently losing it would be worse
+
+    def test_reserve_is_atomic_for_concurrent_requests(self):
+        led = Ledger()
+        led.earn("amina", 100.0, "operated")
+        seen: list[float] = []
+
+        def take():
+            before, _burned = led.reserve("amina", 60.0, "escrow")
+            seen.append(before)
+
+        threads = [threading.Thread(target=take) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertEqual(sorted(seen), [40.0, 100.0],
+                         "the second reserve must see the first one's debit")
+        self.assertAlmostEqual(led.balance("amina"), 0.0, places=6)
+
+    def test_discovery_ignores_non_private_sources(self):
+        from sanad_net.discovery import _is_private
+        self.assertTrue(_is_private("192.168.1.5"))
+        self.assertTrue(_is_private("10.0.0.3"))
+        self.assertTrue(_is_private("127.0.0.1"))
+        self.assertFalse(_is_private("8.8.8.8"))
+        self.assertFalse(_is_private("not-an-ip"))
+
+    def test_discovery_is_off_for_a_loopback_coordinator(self):
+        from sanad_net.discovery import DiscoveryResponder
+        r = DiscoveryResponder(http_port=7899, bind="127.0.0.1")
+        self.assertFalse(r.start(), "a loopback-only coordinator has nothing to discover")
+        self.assertFalse(r.active)
 
 
 class TestHTTPSurface(unittest.TestCase):

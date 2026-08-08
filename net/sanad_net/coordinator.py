@@ -37,12 +37,14 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .discovery import DiscoveryResponder
+from .discovery import DISCOVERY_PORT, DiscoveryResponder
 from .engine import EngineError, EngineManager
 from .ledger import Ledger
 
 NODE_TTL_S = 15.0           # node considered dead if no heartbeat within this window
-POOL_SAFETY_FACTOR = 1.4    # model needs file_size * factor of pooled memory (KV + overhead)
+MODEL_OVERHEAD = 1.15       # weights plus fixed runtime overhead
+KV_PER_SLOT = 0.06          # KV cache per concurrent slot, as a fraction of weights
+REPAIR_DEBOUNCE_S = 20.0    # one rebuild serves every failure inside this window
 MAX_TOKENS_CAP = 512        # per-request generation cap
 MAX_PLEDGE_MB = 1_000_000   # 1 TB — sanity bound; also rejects Infinity/NaN from JSON
 MAX_BODY_BYTES = 1_048_576  # 1 MB request-body cap
@@ -67,17 +69,22 @@ class ModelTier:
     name: str
     path: Path
     file_mb: float
+    slots: int = 1
 
     @property
     def need_mb(self) -> float:
-        return self.file_mb * POOL_SAFETY_FACTOR
+        """Pooled memory this tier needs: weights, runtime overhead, and KV
+        cache for every concurrent slot. Concurrency is not free — a ladder
+        that ignores it will pick a model the pool cannot actually hold."""
+        return self.file_mb * (MODEL_OVERHEAD + KV_PER_SLOT * self.slots)
 
 
-def load_catalog(paths: list[str]) -> list[ModelTier]:
+def load_catalog(paths: list[str], slots: int = 1) -> list[ModelTier]:
     tiers = []
     for p in paths:
         path = Path(p).resolve()
-        tiers.append(ModelTier(name=path.stem, path=path, file_mb=path.stat().st_size / 1e6))
+        tiers.append(ModelTier(name=path.stem, path=path,
+                               file_mb=path.stat().st_size / 1e6, slots=max(1, slots)))
     return sorted(tiers, key=lambda t: t.file_mb)  # smallest first
 
 
@@ -139,7 +146,9 @@ def pick_tier(catalog: list[ModelTier], pool_mb: float) -> ModelTier | None:
 
 class Coordinator:
     RETRY_DELAY_S = 4.0        # > heartbeat period, so live nodes re-appear before a retry
-    FIFO_EVERY = 3             # every Nth slot is strictly first-come-first-served
+    FIFO_EVERY = 3             # every Nth slot goes to the least-recently-served account
+    GUEST_RATE = 0.34          # a zero-credit job still accrues priority at ~1/3 speed
+    CREDIT_HALF = 500.0        # credits for half the gap between guest and maximum rate
 
     def __init__(self, engines: EngineManager, catalog: list[ModelTier],
                  ledger: Ledger | None = None, concurrency: int = 4) -> None:
@@ -155,6 +164,9 @@ class Coordinator:
         self._pending: list[dict] = []
         self._cv = threading.Condition()
         self._slots = threading.Semaphore(self.concurrency)
+        self._repair_lock = threading.Lock()
+        self._last_repair = 0.0
+        self._last_served_at: dict[str, float] = {}
         self._served = 0
         self._seq = 0
         engines.on_event = self._event
@@ -199,13 +211,19 @@ class Coordinator:
         with self._cv:
             self._seq += 1
             seq = self._seq
-        priority = -self.ledger.balance(user)  # higher balance -> served first
-        escrow = self.ledger.spend(user, float(max_tokens), f"escrow for job #{seq}")
+        # Read the balance and take the escrow in ONE atomic step, so two
+        # concurrent requests from the same account cannot both price
+        # themselves off the same pre-spend balance.
+        balance_before, escrow = self.ledger.reserve(
+            user, float(max_tokens), f"escrow for job #{seq}")
+        priority = -balance_before             # higher balance -> served first
         job = {
             "seq": seq, "priority": priority, "user": user, "prompt": prompt,
             "messages": messages or [{"role": "user", "content": prompt}],
+            "submitted_at": time.time(),
             "max_tokens": max_tokens, "escrow": escrow, "stream_q": stream_q,
             "done": threading.Event(), "slot": {}, "cancelled": False, "started": False,
+            "streamed": False,
         }
         with self._cv:
             self._pending.append(job)
@@ -223,14 +241,42 @@ class Coordinator:
         return job["slot"]["result"]
 
     def _pop_next_locked(self) -> dict:
-        """Every FIFO_EVERY-th slot is strictly by arrival order — the
-        anti-starvation reserve that keeps zero-credit users moving."""
+        """Pick the next job by accumulated priority, with a per-account
+        reserve lane.
+
+        Two properties this has to have, both learned the hard way:
+
+        * **No one waits forever.** Ordering purely by a credit *stock* is
+          Cobham (1954) static priority, whose lowest class waits without bound
+          while higher-priority work keeps arriving. Priority here therefore
+          accumulates with waiting: score = rate x seconds-waited, where rate
+          comes from credits. A contributor still overtakes, but a guest's
+          score climbs until it wins — bounded, not merely "eventually".
+        * **The reserve lane is per account.** Handing every Nth slot to the
+          globally-oldest job let a single guest flooding requests own the
+          whole lane and starve every other guest — the exact population the
+          lane exists to protect. The lane now rotates over *accounts*, so one
+          person cannot occupy it.
+        """
+        now = time.time()
         self._served += 1
         if self._served % self.FIFO_EVERY == 0:
-            job = min(self._pending, key=lambda j: j["seq"])
+            # Reserve lane: pick the account waiting longest (least recently
+            # served), then that account's oldest job.
+            def lane_key(j: dict) -> tuple:
+                return (self._last_served_at.get(j["user"], 0.0), j["seq"])
+            job = min(self._pending, key=lane_key)
         else:
-            job = min(self._pending, key=lambda j: (j["priority"], j["seq"]))
+            # rate in (0, 1]: credits raise it, but never to infinity, so the
+            # gap between a whale and a guest stays bounded.
+            def score(j: dict) -> float:
+                credits = max(-j["priority"], 0.0)
+                rate = self.GUEST_RATE + (1.0 - self.GUEST_RATE) * (
+                    credits / (credits + self.CREDIT_HALF))
+                return rate * (now - j["submitted_at"])
+            job = max(self._pending, key=score)
         self._pending.remove(job)
+        self._last_served_at[job["user"]] = now
         return job
 
     def _dispatch_loop(self) -> None:
@@ -238,18 +284,38 @@ class Coordinator:
         thread so several people are served at once (the engine interleaves
         them across its slots with continuous batching)."""
         while True:
-            self._slots.acquire()
-            with self._cv:
-                while not self._pending:
-                    self._cv.wait()
-                job = self._pop_next_locked()
-            if job["cancelled"]:
-                self._event(f"job #{job['seq']} cancelled before start - skipped (escrow refunded)")
-                job["done"].set()
+            job = None
+            try:
+                self._slots.acquire()
+                with self._cv:
+                    while not self._pending:
+                        self._cv.wait()
+                    job = self._pop_next_locked()
+                    # Claim-or-skip must be atomic with the pop: otherwise a
+                    # job can be refunded as "timed out" and still run, minting
+                    # credits against an escrow that was already returned.
+                    cancelled = job["cancelled"]
+                    if not cancelled:
+                        job["started"] = True
+                if cancelled:
+                    self._event(f"job #{job['seq']} cancelled before start - "
+                                "skipped (escrow refunded)")
+                    job["done"].set()
+                    self._slots.release()
+                    continue
+                threading.Thread(target=self._execute, args=(job,), daemon=True).start()
+            except Exception as exc:
+                # The dispatcher must never die: a dead dispatcher stops all
+                # inference while /status still looks healthy.
+                self._event(f"WARNING dispatcher error: {type(exc).__name__}: {exc}")
+                if job is not None:
+                    job["slot"]["error"] = f"{type(exc).__name__}: {exc}"
+                    if job["escrow"] > 0:
+                        self.ledger.earn(job["user"], job["escrow"],
+                                         f"escrow refund (job #{job['seq']} dispatch failed)")
+                    job["done"].set()
                 self._slots.release()
-                continue
-            job["started"] = True
-            threading.Thread(target=self._execute, args=(job,), daemon=True).start()
+                time.sleep(0.1)
 
     def _execute(self, job: dict) -> None:
         try:
@@ -269,18 +335,35 @@ class Coordinator:
             self._slots.release()
 
     def _run_job_with_repair(self, job: dict) -> dict:
-        """On pipeline failure, evict nodes with no heartbeat since the job
-        started, wait past a heartbeat period so live nodes re-appear, rebuild
-        the engine, and retry once. Capacity errors fail fast."""
+        """On pipeline failure, evict nodes that have genuinely gone silent,
+        rebuild the engine once, and retry. Capacity errors fail fast.
+
+        Two properties matter under concurrency: a node that is heartbeating
+        normally is never evicted just because one request failed, and a burst
+        of simultaneous failures triggers ONE rebuild rather than a storm.
+        """
         try:
             return self._run_job(job)
         except ChainFailure as exc:
-            stale = [nid for nid in exc.node_ids if self.registry.last_seen(nid) < exc.job_start_ts]
-            for nid in stale:
-                self.registry.suspect(nid)
-            self.engines.invalidate()
-            self._event(f"chain failed - suspected {stale or 'no'} stale nodes; "
-                        "rebuilding engine and retrying")
+            if job.get("streamed"):
+                # Tokens already reached the user; a retry would append a second
+                # answer to the same bubble. Fail honestly instead.
+                raise
+            now = time.time()
+            with self._repair_lock:
+                fresh_repair = now - self._last_repair > REPAIR_DEBOUNCE_S
+                if fresh_repair:
+                    self._last_repair = now
+                    silent = [nid for nid in exc.node_ids
+                              if self.registry.last_seen(nid) < now - NODE_TTL_S]
+                    for nid in silent:
+                        self.registry.suspect(nid)
+                    self.engines.invalidate()
+                    self._event(f"chain failed - evicted {silent or 'no'} silent node(s); "
+                                "rebuilding engine once and retrying")
+                else:
+                    self._event(f"chain failed - a rebuild is already in progress; "
+                                "job #{} will retry against it".format(job["seq"]))
             time.sleep(self.RETRY_DELAY_S)
             return self._run_job(job, repaired=True)
 
@@ -296,7 +379,9 @@ class Coordinator:
             engine = self.engines.ensure(tier.path, nodes)
             on_token = None
             if job["stream_q"] is not None:
-                on_token = lambda t: job["stream_q"].put(("token", t))  # noqa: E731
+                def on_token(t: str) -> None:
+                    job["streamed"] = True     # past this point a retry would double up
+                    job["stream_q"].put(("token", t))
             result = engine.chat(job["messages"], job["max_tokens"], on_token=on_token)
         except EngineError as exc:
             failure = ChainFailure(str(exc))
@@ -335,6 +420,7 @@ class Coordinator:
         return {
             "user": job["user"],
             "model": tier.name,
+            "turns": len(job["messages"]),      # how much conversation was carried
             "priority_at_submit": -job["priority"],
             "repaired": repaired,
             "pool_mb": round(pool_mb, 1),
@@ -425,8 +511,6 @@ def make_handler(coord: Coordinator):
             if messages is not None:
                 if not isinstance(messages, list) or not messages:
                     raise ValueError("messages must be a non-empty list")
-                if len(messages) > MAX_MESSAGES:
-                    messages = messages[-MAX_MESSAGES:]      # keep the recent turns
                 clean = []
                 for m in messages:
                     role = str(m.get("role", "user"))
@@ -434,6 +518,15 @@ def make_handler(coord: Coordinator):
                         raise ValueError(f"unknown message role: {role}")
                     content = str(m.get("content", ""))[:MAX_MESSAGE_CHARS]
                     clean.append({"role": role, "content": content})
+                if len(clean) > MAX_MESSAGES:
+                    # Trim the middle, never the head: a leading system message
+                    # sets the rules for the whole conversation, and dropping it
+                    # silently changes the model's behavior.
+                    head = [m for m in clean[:1] if m["role"] == "system"]
+                    tail = clean[len(head):][-(MAX_MESSAGES - len(head)):]
+                    clean = head + tail
+                if clean[-1]["role"] != "user":
+                    raise ValueError("the last message must be from the user")
                 prompt = clean[-1]["content"]
                 return user, prompt, max_tokens, clean
 
@@ -528,7 +621,7 @@ def main() -> None:
                     help="do not answer LAN discovery broadcasts")
     args = ap.parse_args()
 
-    catalog = load_catalog(args.models.split(","))
+    catalog = load_catalog(args.models.split(","), slots=args.concurrency)
     engines = EngineManager(Path(args.llama_bin).resolve(), port=args.engine_port,
                             slots=args.concurrency)
     ledger = Ledger(path=Path(args.ledger)) if args.ledger else Ledger()
@@ -539,17 +632,21 @@ def main() -> None:
               "trusted networks only.")
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(coord))
     responder = None
+    discovery_on = False
     if not args.no_discovery:
-        responder = DiscoveryResponder(args.port, name=args.name)
-        responder.start()
+        responder = DiscoveryResponder(args.port, name=args.name, bind=args.bind)
+        discovery_on = responder.start()
     tiers = " -> ".join(f"{t.name} (needs {t.need_mb:.0f} MB)" for t in catalog)
     print(f"[sanad-coordinator] http://{args.bind}:{args.port}  (open it in a browser to chat)")
     print(f"[sanad-coordinator] ladder: {tiers}")
     print(f"[sanad-coordinator] serving up to {args.concurrency} requests at once"
           + (f"; ledger: {args.ledger}" if args.ledger else "; ledger: in-memory (use --ledger to persist)"))
-    if responder is not None:
-        print(f"[sanad-coordinator] nodes on this network can join with: "
-              f"python -m sanad_net.node --discover ...")
+    if discovery_on:
+        print("[sanad-coordinator] nodes on this network can join with: "
+              "python -m sanad_net.node --discover ...")
+    elif not args.no_discovery:
+        print(f"[sanad-coordinator] discovery is off (loopback bind or port {DISCOVERY_PORT} "
+              f"in use); nodes must pass --coordinator http://<address>:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -557,7 +654,7 @@ def main() -> None:
     finally:
         if responder is not None:
             responder.stop()
-        engines.stop()
+        engines.stop()          # stop serving before closing the books
         ledger.close()
 
 

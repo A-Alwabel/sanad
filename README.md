@@ -4,7 +4,7 @@
 
 **Sanad** (Arabic: *سند*, "support" — and the classical term for the **chain of transmission** that carries knowledge from person to person, each link vouching for the next) is a community inference network for large open-weight language models. Nodes each hold a *slice* of a model's layers; chained together, they serve models none of them could run alone. Contributing compute earns **non-tradeable credits** that give you priority when you use the network.
 
-**Status: it works, and you can use it (v0.3).** Three proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
+**Status: usable together (v0.4).** Four proven milestones, each with a full captured transcript in [docs/PROOF.md](docs/PROOF.md):
 
 - **First Light** — a real model's layers physically split across two node processes over TCP, real text generated through the chain, credits earned by serving and spent as priority.
 - **The Living Network** — the network *breathes*: a **capacity ladder** automatically serves the largest model the community's pooled memory can hold (a second node joining upgraded the model live; a node leaving downgraded it); the **polite node** runs at low OS priority, senses when its owner needs the machine (a CPU-hungry "game" started → it drained out by itself → rejoined by itself when the machine calmed); and credits are **weighted by layer share**. Your device, your priority, always.
@@ -69,7 +69,7 @@ Honesty is a design principle here (over-promising is how this field loses trust
 ```bash
 cd net
 python -m unittest discover -s tests -v      # unit tests, no binaries needed
-python proof/run_it_works.py                 # full network + proof, ends in "IT WORKS: PASS"
+python proof/run_v04.py                      # full network + proof, ends in "V0.4: PASS"
 
 # or just run it and open the chat page in a browser:
 python -m sanad_net.coordinator --port 7860 --bind 0.0.0.0 --models <small.gguf>,<large.gguf> --llama-bin ../.local/bin
@@ -90,6 +90,8 @@ python -m unittest discover -s tests -v
 - [**Prior Art**](docs/PRIOR_ART.md) — the full annotated landscape (Aug 2026), every project this stands on
 - [**Architecture**](docs/ARCHITECTURE.md) — v0 design: roles, credit ledger, trust model, wire sketches
 - [**Roadmap**](docs/ROADMAP.md) — phases with honest exit criteria and kill-criteria
+- [**Science**](docs/SCIENCE.md) — what six disciplines say about this design, what we changed because of them, and what stays open
+- [**Decisions**](docs/DECISIONS.md) — why things are the way they are, including what we got wrong and reversed
 - [**RFC 0001: The Human Loop**](docs/rfc/0001-human-loop.md) — v0.3 design under community review: rate answers, earn credits, build the first fully open preference dataset — with the integrity defenses first and training explicitly deferred
 - [**Contributing**](CONTRIBUTING.md) · [**Governance**](GOVERNANCE.md) · [**Code of Conduct**](CODE_OF_CONDUCT.md)
 

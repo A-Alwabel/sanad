@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -246,6 +247,28 @@ def low_priority_kwargs() -> dict:
     return {"preexec_fn": lambda: os.nice(10)}   # POSIX: 10 niceness levels back
 
 
+# llama.cpp build that fixed CVE-2026-34159 — unauthenticated arbitrary memory
+# read/write in the RPC backend (deserialize_tensor() skipped bounds validation
+# for a null buffer, reachable via GRAPH_COMPUTE). Anything older must not run
+# a node: the RPC port is precisely what a node exposes.
+MIN_LLAMA_BUILD = 8492
+
+
+def llama_build_number(bin_dir: Path) -> int | None:
+    """Read the build number from llama-server --version, or None if unknown."""
+    exe = bin_dir / f"llama-server{EXE}"
+    if not exe.exists():
+        return None
+    try:
+        out = subprocess.run([str(exe), "--version"], capture_output=True, text=True,
+                             timeout=30, cwd=str(bin_dir))
+        text = (out.stderr or "") + (out.stdout or "")
+        m = re.search(r"version:\s*(\d+)", text)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 class PoliteNode:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -253,6 +276,15 @@ class PoliteNode:
         self.rpc_exe = self.bin_dir / f"ggml-rpc-server{EXE}"
         if not self.rpc_exe.exists():
             sys.exit(f"ggml-rpc-server{EXE} not found in {self.bin_dir}")
+        build = llama_build_number(self.bin_dir)
+        if build is not None and build < MIN_LLAMA_BUILD:
+            sys.exit(
+                f"refusing to start: llama.cpp build b{build} is vulnerable to "
+                f"CVE-2026-34159 (unauthenticated remote memory read/write in the RPC "
+                f"backend). Upgrade to b{MIN_LLAMA_BUILD} or later before serving.")
+        if build is None:
+            print("[sanad-node] WARNING: could not determine the llama.cpp build number; "
+                  f"make sure it is b{MIN_LLAMA_BUILD} or later (CVE-2026-34159).")
         self.proc: subprocess.Popen | None = None
         self.serving = False
         self.fsm = SensorFSM(args.busy_at, args.resume_at)
@@ -392,13 +424,23 @@ def main() -> None:
             sys.exit("no coordinator answered on this network. Start one, or pass "
                      "--coordinator http://<its-address>:7860")
         if len(found) > 1:
-            print("[sanad-node] several coordinators answered; using the first:")
+            # Anyone on the network can answer, so an ambiguous result is not
+            # ours to resolve by guessing — picking the fastest reply is exactly
+            # what an impostor would win.
+            print("[sanad-node] more than one coordinator answered:")
             for f in found:
-                print(f"    {f['name']}  {f['coordinator']}")
+                print(f"    {f['name']:20s} {f['coordinator']}   (from {f['from']})")
+            sys.exit("refusing to choose for you. Re-run with "
+                     "--coordinator <the one you trust>")
         args.coordinator = found[0]["coordinator"]
-        print(f"[sanad-node] found '{found[0]['name']}' at {args.coordinator}")
+        print(f"[sanad-node] found '{found[0]['name']}' at {args.coordinator} "
+              f"(answered from {found[0]['from']})")
         if args.host == "127.0.0.1" and not found[0]["from"].startswith("127."):
-            args.host = "0.0.0.0"    # the coordinator is remote: listen for it
+            args.host = "0.0.0.0"
+            print("[sanad-node] NOTE: the coordinator is on another machine, so this node "
+                  "will listen on all interfaces (0.0.0.0). llama.cpp's rpc-server is "
+                  "upstream-labelled 'fragile and insecure' — trusted networks only. "
+                  "Pass --host <address> to bind somewhere narrower.")
     PoliteNode(args).run()
 
 

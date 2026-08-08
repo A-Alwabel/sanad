@@ -212,7 +212,7 @@
           buf = parts.pop();
           parts.forEach(function(chunk){
             var line = chunk.trim();
-            if(!line.indexOf('data:')===0 && line.indexOf('data:')!==0) return;
+            if(line.indexOf('data:') !== 0) return;
             var ev;
             try { ev = JSON.parse(line.slice(5).trim()); } catch(e){ return; }
             if(ev.type === 'token'){ body.textContent += ev.text; scroll(); }

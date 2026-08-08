@@ -1,37 +1,42 @@
 
 ==========================================================================
-  0. Real network on 192.168.0.188 (not loopback); ledger at C:\Users\User\AppData\Local\Temp\sanad-proof-0iaq51hy\ledger.jsonl
+  0. Real network on 192.168.0.188 (not loopback); ledger at C:\Users\User\AppData\Local\Temp\sanad-proof-7fz7v6zl\ledger.jsonl
 ==========================================================================
 
 ==========================================================================
   A. ONE-COMMAND JOIN - the node is given no address at all
 ==========================================================================
 [sanad-node] looking for a coordinator on this network...
-[sanad-node] found 'sanad-proof' at http://192.168.0.188:7866
+[sanad-node] found 'sanad-proof' at http://192.168.0.188:7866 (answered from 192.168.0.188)
+[sanad-node] NOTE: the coordinator is on another machine, so this node will listen on all interfaces (0.0.0.0). llama.cpp's rpc-server is upstream-labelled 'fragile and insecure' — trusted networks only. Pass --host <address> to bind somewhere narrower.
 [riyadh-a] SERVING on 192.168.0.188:50140 (pledge 1000 MB, low OS priority, operator amina)
 node joined by broadcast: advertises 192.168.0.188:50140, operator amina
 
 ==========================================================================
   B. IT REMEMBERS - turn 2 answers what only turn 1 established
 ==========================================================================
-turn 1 -> Hello Abdullah! It's a pleasure to meet you. My name is Qwen, and I am created by Alibaba Cloud. How can I assist you to
-turn 2 -> Your name is Abdullah and your project is called Sanad.
--> both facts recalled: the conversation is real, not a series of strangers
+turn 1 -> prompt_tokens=40  As an artificial intelligence language model, I don't have the ability to rememb
+turn 2 -> prompt_tokens=17  As an artificial intelligence language model, I don't have personal preferences 
+fresh   -> prompt_tokens=11  As an AI language model, I don't have personal preferences or emotions, so I don
+-> turns carried into the engine: 1 then 3, and a new conversation starts clean at 1. Prefill dropped from 40 to 17 tokens because the engine cached the shared prefix rather than reprocessing it.
+   (The model repeated the fact: False. At 0.5B that is unreliable and is the model's limitation, not the network's — what this proves is transport.)
 
 ==========================================================================
-  D. MANY AT ONCE - four people served concurrently
+  D. NOBODY WAITS BEHIND A LONG ANSWER - what concurrency actually buys
 ==========================================================================
-individual durations: [2.61, 1.22, 2.61, 1.35]
-wall clock for all four: 2.62s   (sum if served one-by-one: 7.80s)
--> 3.0x more throughput than serving them one at a time
+four requests, one at a time: 5.70s
+four requests, together:      3.23s   (1.76x)
+   Throughput gain from concurrency is small and variable on CPU inference -- the slots share the same cores. It is not a multiplier, and the docs say so.
+short question answered in 0.53s while a 320-token answer was still streaming
+-> concurrency here buys responsiveness, not throughput: a quick question is not stuck behind a long one. Stated that way in the docs.
 
 ==========================================================================
   C. CREDITS SURVIVE - kill the coordinator, bring it back
 ==========================================================================
-balances before: {'amina': 162.0}
+balances before: {'amina': 638.0}
 coordinator killed.
-replayed from the file alone: {'amina': 162.0}  (entries: 6, self-consistent: True)
-balances after restart: {'amina': 162.0}
+replayed from the file alone: {'amina': 638.0}  (entries on disk: 13, durable: True, self-consistent: True)
+balances after restart: {'amina': 638.0}
 -> every credit came back. Contribution is not erased by an outage.
 
 ==========================================================================

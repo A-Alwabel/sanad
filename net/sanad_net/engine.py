@@ -17,6 +17,7 @@ request.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -30,6 +31,12 @@ from pathlib import Path
 EXE = ".exe" if os.name == "nt" else ""
 START_TIMEOUT_S = 300.0     # model must stream to every node before it is ready
 HEALTH_POLL_S = 0.5
+DRAIN_TIMEOUT_S = 90.0      # how long a rebuild waits for in-flight answers to finish
+
+# A stream cut mid-flight surfaces as any of these, and none of them is a
+# URLError — catching only URLError is how an earlier version let a dead
+# pipeline bypass the repair path entirely.
+STREAM_ERRORS = (urllib.error.URLError, http.client.HTTPException, ConnectionError, OSError)
 
 
 class EngineError(RuntimeError):
@@ -89,6 +96,11 @@ class Engine:
         self.load_s: float = 0.0
         self._log: list[str] = []
         self._log_lock = threading.Lock()
+        # In-flight accounting: a rebuild must never terminate a process that
+        # somebody is still streaming an answer from.
+        self._inflight = 0
+        self._idle = threading.Condition()
+        self._retired = False
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -156,6 +168,18 @@ class Engine:
         self.stop()
         raise EngineError(f"llama-server did not become healthy within {START_TIMEOUT_S:.0f}s")
 
+    def retire(self, timeout_s: float = DRAIN_TIMEOUT_S) -> bool:
+        """Stop accepting new work, wait for in-flight answers, then stop.
+
+        Returns False if the drain timed out (callers may stop anyway, but the
+        event log should say so).
+        """
+        with self._idle:
+            self._retired = True
+            drained = self._idle.wait_for(lambda: self._inflight == 0, timeout=timeout_s)
+        self.stop()
+        return drained
+
     def stop(self) -> None:
         if self.proc is not None:
             try:
@@ -171,6 +195,10 @@ class Engine:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def inflight(self) -> int:
+        with self._idle:
+            return self._inflight
+
     # -- inference -----------------------------------------------------------
     def chat(self, messages: list[dict], max_tokens: int, on_token=None,
              temperature: float = 0.7) -> dict:
@@ -184,8 +212,19 @@ class Engine:
         `on_token(text)` is called per chunk as it arrives.
         Returns {"text", "decode_tokens", "tok_per_s", "wall_s", "ttft_s"}.
         """
-        if not self.alive():
-            raise EngineError("engine is not running")
+        with self._idle:
+            if self._retired or not self.alive():
+                raise EngineError("engine is not accepting requests")
+            self._inflight += 1
+        try:
+            return self._chat(messages, max_tokens, on_token, temperature)
+        finally:
+            with self._idle:
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._idle.notify_all()
+
+    def _chat(self, messages, max_tokens, on_token, temperature) -> dict:
         payload = json.dumps({
             "messages": messages,
             "max_tokens": max_tokens,
@@ -220,11 +259,14 @@ class Engine:
                             on_token(piece)
                     if chunk.get("timings"):
                         timings = chunk["timings"]
-        except urllib.error.URLError as exc:
-            raise EngineError(f"engine request failed: {exc}") from exc
+        except STREAM_ERRORS as exc:
+            # Includes a stream cut when the pipeline dies mid-answer; it must
+            # reach the coordinator as an EngineError so repair can act.
+            raise EngineError(f"engine request failed: {type(exc).__name__}: {exc}") from exc
 
         wall = time.time() - t0
         decode_tokens = int(timings.get("predicted_n", 0) or 0)
+        prompt_tokens = int(timings.get("prompt_n", 0) or 0)
         tok_per_s = float(timings.get("predicted_per_second", 0.0) or 0.0)
         if not decode_tokens:
             decode_tokens = len(pieces)          # chunks ≈ tokens for this engine
@@ -233,6 +275,7 @@ class Engine:
         return {
             "text": "".join(pieces).strip(),
             "decode_tokens": decode_tokens,
+            "prompt_tokens": prompt_tokens,
             "tok_per_s": round(tok_per_s, 2),
             "wall_s": round(wall, 2),
             "ttft_s": round(ttft, 2),
@@ -268,12 +311,23 @@ class EngineManager:
                 tuple((n["node_id"], n["host"], n["port"], n["pledge_mb"]) for n in nodes))
 
     def ensure(self, model_path: Path, nodes: list[dict]) -> Engine:
+        """Return a ready engine for this pipeline, rebuilding only if needed.
+
+        A rebuild retires the previous engine gracefully: it stops accepting new
+        requests and waits for in-flight answers to finish before the process is
+        stopped, so a membership change never kills someone else's reply
+        mid-sentence.
+        """
         sig = self._signature(model_path, nodes)
         with self._lock:
             if self.engine is not None and self.engine.alive() and self.signature == sig:
                 return self.engine                      # warm: no reload, no wait
-            if self.engine is not None:
-                self.engine.stop()
+            old = self.engine
+            if old is not None:
+                self.on_event(f"pipeline changed - draining {old.inflight()} in-flight "
+                              "request(s) before rebuilding")
+                if not old.retire():
+                    self.on_event("WARNING drain timed out; stopping the old engine anyway")
                 self.restarts += 1
             eng = Engine(
                 self.bin_dir, model_path,
